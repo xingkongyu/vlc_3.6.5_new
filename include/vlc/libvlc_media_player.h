@@ -1250,6 +1250,29 @@ LIBVLC_API libvlc_track_description_t *
 LIBVLC_API int libvlc_video_set_spu( libvlc_media_player_t *p_mi, int i_spu );
 
 /**
+ * Set the scale factor applied to bitmap subtitles (PGS / DVDSUB ...).
+ *
+ * Affects only subtitles rendered by VLC itself; text subtitles drawn by the
+ * application are not affected. Can be called before or during playback.
+ *
+ * \param p_mi media player
+ * \param f_scale scale factor, 0.1 to 5.0 (1.0 = original size)
+ * \version LibVLC 3.6.5 (hhhc)
+ */
+LIBVLC_API void libvlc_video_set_sub_scale( libvlc_media_player_t *p_mi,
+                                            float f_scale );
+
+/**
+ * Set the tint colour applied to bitmap subtitles (PGS / DVDSUB ...).
+ *
+ * \param p_mi media player
+ * \param i_color colour as 0xAARRGGBB; 0 keeps the original subtitle colour
+ * \version LibVLC 3.6.5 (hhhc)
+ */
+LIBVLC_API void libvlc_video_set_sub_color( libvlc_media_player_t *p_mi,
+                                            unsigned int i_color );
+
+/**
  * Get the current subtitle delay. Positive values means subtitles are being
  * displayed later, negative values earlier.
  *

@@ -38,6 +38,7 @@
 #include <vlc_modules.h>
 #include <vlc_input.h>
 #include <vlc_vout.h>
+#include <vlc_subpicture.h>   /* spu_SetUserScale / spu_SetUserColor */
 #include <vlc_url.h>
 
 #include "libvlc_internal.h"
@@ -393,6 +394,33 @@ end:
     vlc_object_release (p_input_thread);
     var_FreeList (&list, NULL);
     return i_ret;
+}
+
+/**
+ * 设置图形字幕（PGS / DVDSUB 等位图字幕）的缩放系数。
+ *
+ * 参数经 core 的 spu_SetUserScale() 落到 SpuRenderRegion 渲染路径，
+ * 播放前与播放中调用均生效；文本字幕（外部自绘）不受影响。
+ *
+ * @param p_mi    media player（保留参数，与其他 libvlc_video_* 接口保持一致）
+ * @param f_scale 缩放系数 0.1 ~ 5.0，1.0 为原始大小
+ */
+void libvlc_video_set_sub_scale( libvlc_media_player_t *p_mi, float f_scale )
+{
+    VLC_UNUSED( p_mi );
+    spu_SetUserScale( f_scale );
+}
+
+/**
+ * 设置图形字幕的重着色颜色。
+ *
+ * @param p_mi    media player（保留参数）
+ * @param i_color 0xAARRGGBB；传 0 表示不重着色、保留字幕原色
+ */
+void libvlc_video_set_sub_color( libvlc_media_player_t *p_mi, unsigned i_color )
+{
+    VLC_UNUSED( p_mi );
+    spu_SetUserColor( (int) i_color );
 }
 
 int libvlc_video_set_subtitle_file( libvlc_media_player_t *p_mi,

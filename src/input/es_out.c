@@ -54,6 +54,15 @@
 /* FIXME we should find a better way than including that */
 #include "../text/iso-639_def.h"
 
+/* 字幕链路排查日志（VLCSpuTrace）：直接写 logcat，不依赖 VLC 日志级别。
+ * 用于定位「字幕 ES 是否被 demuxer 添加 / 解码器是否创建成功」这类问题。 */
+#ifdef __ANDROID__
+# include <android/log.h>
+# define SPUTRACE(...) __android_log_print( ANDROID_LOG_INFO, "VLCSpuTrace", __VA_ARGS__ )
+#else
+# define SPUTRACE(...) do {} while ( 0 )
+#endif
+
 /*****************************************************************************
  * Local prototypes
  *****************************************************************************/
@@ -1632,6 +1641,14 @@ static es_out_id_t *EsOutAddSlave( es_out_t *out, const es_format_t *fmt, es_out
 
     TAB_APPEND( p_sys->i_es, p_sys->es, es );
 
+    if( es->fmt.i_cat == SPU_ES )
+    {
+        char psz_codec[5];
+        memcpy( psz_codec, &es->fmt.i_codec, 4 );
+        psz_codec[4] = '\0';
+        SPUTRACE( "spu ES added: id=0x%x (%d) codec=%s", es->i_id, es->i_id, psz_codec );
+    }
+
     if( es->p_pgrm == p_sys->p_pgrm )
         EsOutESVarUpdate( out, es, false );
 
@@ -1680,6 +1697,10 @@ static void EsCreateDecoder( es_out_t *out, es_out_id_t *p_es )
     p_es->p_dec = input_DecoderNew( p_input, &p_es->fmt, p_es->p_pgrm->p_clock, input_priv(p_input)->p_sout );
     if( p_es->p_dec )
     {
+        if( p_es->fmt.i_cat == SPU_ES )
+            SPUTRACE( "spu-es SELECTED: id=0x%x (%d) dec=%p",
+                      p_es->i_id, p_es->i_id, (void *)p_es->p_dec );
+
         if( p_sys->b_buffering )
             input_DecoderStartWait( p_es->p_dec );
 
@@ -1689,6 +1710,10 @@ static void EsCreateDecoder( es_out_t *out, es_out_id_t *p_es )
             if( p_es->p_dec_record && p_sys->b_buffering )
                 input_DecoderStartWait( p_es->p_dec_record );
         }
+    }
+    else if( p_es->fmt.i_cat == SPU_ES )
+    {
+        SPUTRACE( "spu-es select FAILED: no decoder (id=0x%x)", p_es->i_id );
     }
 
     EsOutDecoderChangeDelay( out, p_es );
