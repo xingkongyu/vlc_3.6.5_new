@@ -260,6 +260,49 @@ typedef void (*vlc_spu_text_cb)( void *p_data, const char *psz_text,
 VLC_API void vlc_spu_set_text_listener( vlc_spu_text_cb pf_text, void *p_data,
                                         bool b_listener_only );
 
+/**
+ * 位图字幕（PGS / DVDSUB 等）RGBA 回传回调。
+ *
+ * 由 spu 渲染线程在"当前应显示的位图字幕"变化时调用：
+ * @param p_data       注册时传入的用户指针
+ * @param i_count      region 数量（0 表示当前无字幕，即清空）
+ * @param pp_rgba      每个 region 一个像素缓冲，字节序 R,G,B,A（非预乘）
+ * @param p_rects      每个 region 4 个 int：x, y, w, h
+ * @param i_video_w    视频基准宽度
+ * @param i_video_h    视频基准高度
+ * @param i_start      字幕起始时间（微秒）
+ * @param i_stop       字幕结束时间（微秒，0 表示未知）
+ *
+ * 与文本桥一样：回调在 spu 渲染线程且持有 spu 锁，实现方只能做轻量转发。
+ */
+typedef void (*vlc_spu_bitmap_cb)( void *p_data, int i_count,
+                                   const uint8_t *const *pp_rgba,
+                                   const int *p_rects,
+                                   int i_video_w, int i_video_h,
+                                   int64_t i_start, int64_t i_stop );
+
+/**
+ * 注册/注销位图字幕回传。
+ *
+ * @param pf_bitmap     回调函数；传 NULL 注销
+ * @param p_data        回调用户指针
+ * @param b_listener_only true 时由监听者绘制（core 不再把位图字幕上屏）
+ */
+VLC_API void vlc_spu_set_bitmap_listener( vlc_spu_bitmap_cb pf_bitmap, void *p_data,
+                                          bool b_listener_only );
+
+/**
+ * 图形字幕用户缩放系数（0.1 ~ 5.0，1.0 = 原始大小）。
+ * 作用于 VLC 内置渲染的位图字幕，供 libvlcjni 的 setSubtitleScale 使用。
+ */
+VLC_API void spu_SetUserScale( float f_scale );
+
+/**
+ * 图形字幕重着色（0xAARRGGBB）；0 表示不重着色、保留原色。
+ * 供 libvlcjni 的 setSubtitleColor 使用。
+ */
+VLC_API void spu_SetUserColor( int i_color );
+
 /**@}*/
 
 #endif /* _VLC_VIDEO_H */

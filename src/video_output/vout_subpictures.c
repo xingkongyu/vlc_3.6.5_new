@@ -39,6 +39,9 @@
 #include <vlc_vout.h>
 #include <vlc_filter.h>
 #include <vlc_spu.h>
+/* 文本/位图字幕桥与用户参数声明（VLC_API 决定符号可见性，缺了会导致
+ * libvlcjni 链接时报 undefined reference） */
+#include <vlc_subpicture.h>
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -140,6 +143,59 @@ static void spu_text_bridge_update( const char *psz_text,
     vlc_mutex_unlock( &spu_text_bridge.lock );
 
     pf( p_data, psz_text ? psz_text : "", i_start, i_stop );
+}
+
+/*****************************************************************************
+ * 图形字幕用户参数（缩放 / 颜色）与位图回传监听
+ *
+ * 由 libvlcjni 通过 MediaPlayer.setSubtitleScale / setSubtitleColor /
+ * setSubtitleBitmapListener 下发。参数是进程级（App 只用一个 LibVLC 实例）。
+ *
+ * 当前版本只做"接收与保存"：
+ *  - 缩放/颜色尚未在 SpuRenderRegion 渲染路径上生效（接入点已留好：
+ *    在 SpuRenderSubpictures 里读取 f_scale 调整 region scale，
+ *    渲染后按 i_color 重着色）；
+ *  - 位图回传回调已可注册，但 core 尚未主动回调（接管模式未启用，
+ *    此时位图字幕仍由 VLC 内置渲染上屏，行为与未注册时一致）。
+ * 这样可保证 AAR 的 API 全部存在、App 无需改动即可运行，
+ * 且不会因未验证的渲染改动破坏字幕显示。
+ *****************************************************************************/
+static struct {
+    vlc_mutex_t       lock;
+    float             f_scale;
+    int               i_color;
+    vlc_spu_bitmap_cb pf_bitmap;
+    void             *p_bitmap_data;
+    bool              b_bitmap_only;
+} spu_user_params = { VLC_STATIC_MUTEX, 1.f, 0, NULL, NULL, false };
+
+void spu_SetUserScale( float f_scale )
+{
+    if ( f_scale < 0.1f )
+        f_scale = 0.1f;
+    else if ( f_scale > 5.f )
+        f_scale = 5.f;
+
+    vlc_mutex_lock( &spu_user_params.lock );
+    spu_user_params.f_scale = f_scale;
+    vlc_mutex_unlock( &spu_user_params.lock );
+}
+
+void spu_SetUserColor( int i_color )
+{
+    vlc_mutex_lock( &spu_user_params.lock );
+    spu_user_params.i_color = i_color;
+    vlc_mutex_unlock( &spu_user_params.lock );
+}
+
+void vlc_spu_set_bitmap_listener( vlc_spu_bitmap_cb pf_bitmap, void *p_data,
+                                  bool b_listener_only )
+{
+    vlc_mutex_lock( &spu_user_params.lock );
+    spu_user_params.pf_bitmap = pf_bitmap;
+    spu_user_params.p_bitmap_data = p_data;
+    spu_user_params.b_bitmap_only = b_listener_only;
+    vlc_mutex_unlock( &spu_user_params.lock );
 }
 
 /*****************************************************************************
