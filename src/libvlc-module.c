@@ -1700,6 +1700,18 @@ vlc_module_begin ()
     add_integer_with_range( "sub-text-scale", 100, 10, 500,
                SUB_TEXT_SCALE_TEXT, SUB_TEXT_SCALE_LONGTEXT, false )
         change_volatile  ()
+    /* 图形（位图）字幕的用户参数。
+     * 定义为 core 配置项而不是在某处 var_Create，这样 media option
+     * （:sub-scale= / :sub-color=）在 input 解析时就能被识别，
+     * 且 vout/spu 可以用 var_Inherit* 继承到。 */
+    add_float( "sub-scale", 1.0,
+               N_( "Bitmap subtitle scale" ),
+               N_( "Scale factor applied to bitmap (non-text) subtitles. "
+                   "1.0 is the original size; the anchor stays centered." ), false )
+    add_integer( "sub-color", 0,
+                 N_( "Bitmap subtitle color" ),
+                 N_( "ARGB color (0xAARRGGBB) applied to bitmap (non-text) subtitles; "
+                     "the original alpha is used as a mask. 0 disables recoloring." ), false )
     set_section( N_( "Overlays" ) , NULL )
     add_module_list( "sub-source", "sub source", NULL,
                      SUB_SOURCE_TEXT, SUB_SOURCE_LONGTEXT, false )

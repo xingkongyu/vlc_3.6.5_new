@@ -1678,26 +1678,6 @@ spu_t *spu_Create(vlc_object_t *object, vout_thread_t *vout)
     sys->source_chain = filter_chain_New(spu, "sub source", SPU_ES);
     sys->filter_chain = filter_chain_New(spu, "sub filter", SPU_ES);
 
-    /* 位图字幕参数：同时暴露成 VLC 变量，带 VLC_VAR_DOINHERIT 后
-     * playlist 上的 media option（:sub-scale= / :sub-color=）会被继承到
-     * SpuUserScaleGet / SpuUserColorGet。 */
-    {
-        vlc_value_t text;
-
-        var_Create( spu, "sub-scale", VLC_VAR_FLOAT | VLC_VAR_DOINHERIT );
-        text.psz_string = (char *) "Bitmap subtitle scale";
-        var_Change( spu, "sub-scale", VLC_VAR_SETTEXT, &text, NULL );
-        msg_Dbg( spu, "sub-scale: Scale factor applied to bitmap (non-text) subtitles. "
-                      "1.0 is the original size; the anchor stays centered." );
-
-        var_Create( spu, "sub-color", VLC_VAR_INTEGER | VLC_VAR_DOINHERIT );
-        text.psz_string = (char *) "Bitmap subtitle color";
-        var_Change( spu, "sub-color", VLC_VAR_SETTEXT, &text, NULL );
-        msg_Dbg( spu, "sub-color: ARGB color (0xAARRGGBB) applied to bitmap (non-text) "
-                      "subtitles; the original alpha is used as a mask. "
-                      "0 disables recoloring." );
-    }
-
     /* Load text and scale module（listener-only 时 text 为 NULL，见函数注释） */
     sys->text = SpuRenderCreateAndLoadTextIfNeeded(spu);
 
