@@ -42,6 +42,14 @@
 #include "display.h"
 #include "utils.h"
 
+#ifdef __ANDROID__
+#include <android/log.h>
+/* 字幕修复调试日志：直接写 logcat（tag=VLCSubFix），不依赖 VLC 日志级别 */
+#define SUBFIX_LOG(...) __android_log_print(ANDROID_LOG_INFO, "VLCSubFix", __VA_ARGS__)
+#else
+#define SUBFIX_LOG(...) (void)0
+#endif
+
 /*****************************************************************************
  * Module descriptor
  *****************************************************************************/
@@ -134,7 +142,12 @@ struct vout_display_sys_t
     picture_t *p_sub_pic;
     buffer_bounds *p_sub_buffer_bounds;
     int64_t i_sub_last_order;
-    ARect sub_last_region;
+    vlc_tick_t i_sub_last_start;
+    vlc_tick_t i_sub_last_stop;
+    ARect sub_last_region;      /* region of the last prepared subpicture */
+    ARect sub_surface_region;   /* region currently blended on the subtitles surface */
+    bool b_sub_on_surface;      /* a subpicture is currently blended on the surface */
+    unsigned i_sub_skip_count;  /* consecutive frames skipped (debug stats) */
 
     bool b_has_subpictures;
 
@@ -709,6 +722,10 @@ static int OpenCommon(vout_display_t *vd)
 
         FixSubtitleFormat(sys);
         sys->i_sub_last_order = -1;
+        sys->i_sub_last_start = VLC_TICK_INVALID;
+        sys->i_sub_last_stop = VLC_TICK_INVALID;
+        sys->b_sub_on_surface = false;
+        sys->i_sub_skip_count = 0;
 
         /* Export the subpicture capability of this vout. */
         vd->info.subpicture_chromas = subpicture_chromas;
@@ -969,61 +986,12 @@ static void SubtitleRegionToBounds(subpicture_t *subpicture,
     }
 }
 
-static void SubtitleGetDirtyBounds(vout_display_t *vd,
-                                   subpicture_t *subpicture,
-                                   ARect *p_out_bounds)
-{
-    vout_display_sys_t *sys = vd->sys;
-    int i = 0;
-    bool b_found = false;
-
-    /* Try to find last bounds set by current locked buffer.
-     * Indeed, even if we can lock only one buffer at a time, differents
-     * buffers can be locked. This functions will find the last bounds set by
-     * the current buffer. */
-    if (sys->p_sub_buffer_bounds) {
-        for (; sys->p_sub_buffer_bounds[i].p_pixels != NULL; ++i) {
-            buffer_bounds *p_bb = &sys->p_sub_buffer_bounds[i];
-            if (p_bb->p_pixels == sys->p_sub_pic->p[0].p_pixels) {
-                *p_out_bounds = p_bb->bounds;
-                b_found = true;
-                break;
-            }
-        }
-    }
-
-    if (!b_found
-     || p_out_bounds->left < 0
-     || p_out_bounds->right < 0
-     || (unsigned int) p_out_bounds->right > sys->p_sub_pic->format.i_width
-     || p_out_bounds->bottom < 0
-     || p_out_bounds->top < 0
-     || (unsigned int) p_out_bounds->top > sys->p_sub_pic->format.i_height)
-    {
-        /* default is full picture */
-        p_out_bounds->left = 0;
-        p_out_bounds->top = 0;
-        p_out_bounds->right = sys->p_sub_pic->format.i_width;
-        p_out_bounds->bottom = sys->p_sub_pic->format.i_height;
-    }
-
-    /* buffer not found, add it to the array */
-    if (!sys->p_sub_buffer_bounds
-     || sys->p_sub_buffer_bounds[i].p_pixels == NULL) {
-        buffer_bounds *p_bb = realloc(sys->p_sub_buffer_bounds,
-                                      (i + 2) * sizeof(buffer_bounds));
-        if (p_bb) {
-            sys->p_sub_buffer_bounds = p_bb;
-            sys->p_sub_buffer_bounds[i].p_pixels = sys->p_sub_pic->p[0].p_pixels;
-            sys->p_sub_buffer_bounds[i+1].p_pixels = NULL;
-        }
-    }
-
-    /* set buffer bounds */
-    if (sys->p_sub_buffer_bounds
-     && sys->p_sub_buffer_bounds[i].p_pixels != NULL)
-        SubtitleRegionToBounds(subpicture, &sys->p_sub_buffer_bounds[i].bounds);
-}
+/* 字幕 surface 是多缓冲轮转的：全局的 b_sub_on_surface / surface_region 无法
+ * 准确描述"当前锁到的 buffer 里残留了哪块旧字幕"。旧版基于 per-buffer dirty
+ * bounds 的区域清除在缓冲轮转时会出现 bounds 为空但像素残留的情况（CLEAR
+ * rect=[0,0..0,0]，新字幕直接叠画在旧字幕上 → 重叠/残影）。
+ * 因此改为：凡是需要重绘，一律清除整个字幕 surface。重绘只发生在字幕内容
+ * 变化时（约 1~2 次/秒），全屏 memset 的开销可以忽略；SKIP 帧仍然整体跳过。 */
 
 static void SubpicturePrepare(vout_display_t *vd, subpicture_t *subpicture)
 {
@@ -1034,29 +1002,77 @@ static void SubpicturePrepare(vout_display_t *vd, subpicture_t *subpicture)
 
     if( subpicture )
     {
-        if( subpicture->i_order == sys->i_sub_last_order
+        /* Only skip the redraw when the very same subpicture is already on
+         * the surface: same order, same lifetime and same region. Different
+         * subpictures can share i_order (0, cf. subpicture_New()) and have
+         * identical bounds, so comparing i_order and the bounds alone would
+         * keep the previous subpicture on screen forever. */
+        if( sys->b_sub_on_surface
+         && subpicture->i_order == sys->i_sub_last_order
+         && subpicture->i_start == sys->i_sub_last_start
+         && subpicture->i_stop == sys->i_sub_last_stop
          && memcmp( &memset_bounds, &sys->sub_last_region, sizeof(ARect) ) == 0 )
+        {
+            if (++sys->i_sub_skip_count == 1 || sys->i_sub_skip_count % 60 == 0)
+                SUBFIX_LOG("SKIP redraw #%u: order=%lld rect=[%d,%d..%d,%d]",
+                           sys->i_sub_skip_count, (long long) subpicture->i_order,
+                           memset_bounds.left, memset_bounds.top,
+                           memset_bounds.right, memset_bounds.bottom);
             return;
+        }
 
+        SUBFIX_LOG("REDRAW: order=%lld rect=[%d,%d..%d,%d] on_surface=%d last_rect=[%d,%d..%d,%d]",
+                   (long long) subpicture->i_order,
+                   memset_bounds.left, memset_bounds.top,
+                   memset_bounds.right, memset_bounds.bottom,
+                   sys->b_sub_on_surface,
+                   sys->sub_last_region.left, sys->sub_last_region.top,
+                   sys->sub_last_region.right, sys->sub_last_region.bottom);
+        sys->i_sub_skip_count = 0;
         sys->i_sub_last_order = subpicture->i_order;
+        sys->i_sub_last_start = subpicture->i_start;
+        sys->i_sub_last_stop = subpicture->i_stop;
         sys->sub_last_region = memset_bounds;
     }
+    else if( sys->b_sub_on_surface )
+    {
+        SUBFIX_LOG("REDRAW: subpicture=NULL, clearing leftovers");
+    }
+
+    if( !subpicture && !sys->b_sub_on_surface )
+        return; /* nothing new to draw and nothing to erase */
 
     if (AndroidWindow_LockPicture(sys, sys->p_sub_window, sys->p_sub_pic) != 0)
         return;
 
-    /* Clear the subtitles surface. */
-    SubtitleGetDirtyBounds(vd, subpicture, &memset_bounds);
-    const int x_pixels_offset = memset_bounds.left
-                                * sys->p_sub_pic->p[0].i_pixel_pitch;
-    const int i_line_size = (memset_bounds.right - memset_bounds.left)
-                            * sys->p_sub_pic->p->i_pixel_pitch;
-    for (int y = memset_bounds.top; y < memset_bounds.bottom; y++)
-        memset(&sys->p_sub_pic->p[0].p_pixels[y * sys->p_sub_pic->p[0].i_pitch
-                                              + x_pixels_offset], 0, i_line_size);
+    /* Clear the whole subtitles surface (see the comment above the function:
+     * per-buffer region tracking is unreliable across buffer rotations). */
+    memset_bounds.left = 0;
+    memset_bounds.top = 0;
+    memset_bounds.right = sys->p_sub_pic->format.i_width;
+    memset_bounds.bottom = sys->p_sub_pic->format.i_height;
+
+    SUBFIX_LOG("CLEAR full rect=[%d,%d..%d,%d]",
+               memset_bounds.left, memset_bounds.top,
+               memset_bounds.right, memset_bounds.bottom);
+
+    if (memset_bounds.right > memset_bounds.left
+     && memset_bounds.bottom > memset_bounds.top) {
+        const int x_pixels_offset = memset_bounds.left
+                                    * sys->p_sub_pic->p[0].i_pixel_pitch;
+        const int i_line_size = (memset_bounds.right - memset_bounds.left)
+                                * sys->p_sub_pic->p->i_pixel_pitch;
+        for (int y = memset_bounds.top; y < memset_bounds.bottom; y++)
+            memset(&sys->p_sub_pic->p[0].p_pixels[y * sys->p_sub_pic->p[0].i_pitch
+                                                  + x_pixels_offset], 0, i_line_size);
+    }
 
     if (subpicture)
         picture_BlendSubpicture(sys->p_sub_pic, sys->p_spu_blend, subpicture);
+
+    sys->b_sub_on_surface = subpicture != NULL;
+    if (subpicture)
+        SubtitleRegionToBounds(subpicture, &sys->sub_surface_region);
 }
 
 static picture_pool_t *Pool(vout_display_t *vd, unsigned requested_count)

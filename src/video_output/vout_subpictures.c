@@ -40,9 +40,107 @@
 #include <vlc_filter.h>
 #include <vlc_spu.h>
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 #include "../libvlc.h"
 #include "vout_internal.h"
 #include "../misc/subpicture.h"
+
+/*****************************************************************************
+ * 文本字幕外部渲染桥（Android 自绘场景）
+ *
+ * 外部（如 libvlcjni/Java 层）注册 vlc_spu_text_cb 后：
+ *  - 每当"当前应显示的文本字幕"变化（含清空）时，在 spu 渲染路径上以
+ *    与显示完全同步的时机回调一次（去重后约每条字幕一次）；
+ *  - b_listener_only=true 时，纯文本字幕不再上屏（由外部自绘），
+ *    图形字幕（PGS 等无文本的位图字幕）不受影响、照常上屏。
+ *
+ * 注意：回调在 vout/spu 渲染线程触发，且此时 spu 内部锁被持有——
+ * 回调实现必须只做轻量转发（如 post 到其它线程），严禁同步调用
+ * 会进入 vlc 核心的 API。
+ *****************************************************************************/
+static struct {
+    vlc_mutex_t  lock;
+    vlc_spu_text_cb pf_text;
+    void        *p_data;
+    bool         b_listener_only;
+    char        *psz_last;          /* 上次回调的文本（去重用） */
+} spu_text_bridge = { VLC_STATIC_MUTEX, NULL, NULL, false, NULL };
+
+void vlc_spu_set_text_listener( vlc_spu_text_cb pf_text, void *p_data,
+                                bool b_listener_only )
+{
+    vlc_mutex_lock( &spu_text_bridge.lock );
+    spu_text_bridge.pf_text = pf_text;
+    spu_text_bridge.p_data = p_data;
+    spu_text_bridge.b_listener_only = b_listener_only;
+    free( spu_text_bridge.psz_last );
+    spu_text_bridge.psz_last = NULL;
+    vlc_mutex_unlock( &spu_text_bridge.lock );
+}
+
+/* 组装一条字幕 subpicture 的全部文本（各 region/segment 以换行连接）。
+ * 返回堆上字符串；无文本 region（纯图形字幕）返回 NULL。 */
+static char *spu_text_bridge_text( subpicture_t *subpic )
+{
+    size_t len = 0;
+    for ( subpicture_region_t *r = subpic->p_region; r; r = r->p_next ) {
+        if ( !r->p_text )
+            continue;
+        for ( text_segment_t *s = r->p_text; s; s = s->p_next ) {
+            if ( !s->psz_text )
+                continue;
+            len += strlen( s->psz_text );
+        }
+        len += 1; /* 换行 */
+    }
+    if ( len == 0 )
+        return NULL;
+
+    char *psz = malloc( len + 1 );
+    if ( !psz )
+        return NULL;
+    size_t off = 0;
+    for ( subpicture_region_t *r = subpic->p_region; r; r = r->p_next ) {
+        if ( !r->p_text )
+            continue;
+        for ( text_segment_t *s = r->p_text; s; s = s->p_next ) {
+            if ( !s->psz_text )
+                continue;
+            size_t l = strlen( s->psz_text );
+            memcpy( psz + off, s->psz_text, l );
+            off += l;
+        }
+        psz[off++] = '\n';
+    }
+    psz[off] = '\0';
+    return psz;
+}
+
+/* 去重并回调（psz_text 为 "" 表示清空）。须在持有 sys->lock 时调用。 */
+static void spu_text_bridge_update( const char *psz_text,
+                                    int64_t i_start, int64_t i_stop )
+{
+    vlc_mutex_lock( &spu_text_bridge.lock );
+    vlc_spu_text_cb pf = spu_text_bridge.pf_text;
+    if ( !pf ) {
+        vlc_mutex_unlock( &spu_text_bridge.lock );
+        return;
+    }
+    if ( spu_text_bridge.psz_last && psz_text
+      && !strcmp( spu_text_bridge.psz_last, psz_text ) ) {
+        vlc_mutex_unlock( &spu_text_bridge.lock );
+        return; /* 与上次相同，不重复回调 */
+    }
+    free( spu_text_bridge.psz_last );
+    spu_text_bridge.psz_last = strdup( psz_text ? psz_text : "" );
+    void *p_data = spu_text_bridge.p_data;
+    vlc_mutex_unlock( &spu_text_bridge.lock );
+
+    pf( p_data, psz_text ? psz_text : "", i_start, i_stop );
+}
 
 /*****************************************************************************
  * Local prototypes
@@ -212,6 +310,20 @@ static filter_t *SpuRenderCreateAndLoadText(spu_t *spu)
     var_Create(text, "text-rerender", VLC_VAR_BOOL);
 
     return text;
+}
+
+/* 文本字幕外部自绘（listener-only）时不需要内核文本渲染。
+ * 直接跳过加载 text renderer，可避免 freetype → fontconfig 全量扫描字体
+ * （实测首播卡顿/黑屏的根因之一），同时省掉无用的模块初始化。 */
+static filter_t *SpuRenderCreateAndLoadTextIfNeeded(spu_t *spu)
+{
+    vlc_mutex_lock(&spu_text_bridge.lock);
+    const bool b_listener_only = spu_text_bridge.b_listener_only;
+    vlc_mutex_unlock(&spu_text_bridge.lock);
+
+    if (b_listener_only)
+        return NULL;
+    return SpuRenderCreateAndLoadText(spu);
 }
 
 static filter_t *SpuRenderCreateAndLoadScale(vlc_object_t *object,
@@ -1071,6 +1183,15 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
             subpic->i_original_picture_height = fmt_src->i_visible_height;
         }
 
+        /* 文本字幕只回调不上屏（外部自绘）：跳过纯文本 subpicture */
+        if (subpic->b_subtitle && spu_text_bridge.b_listener_only) {
+            bool b_all_text = true;
+            for (subpicture_region_t *r = subpic->p_region; r; r = r->p_next)
+                if (!r->p_text) { b_all_text = false; break; }
+            if (b_all_text)
+                continue;
+        }
+
         if (sys->text) {
             /* FIXME aspect ratio ? */
             sys->text->fmt_out.video.i_width          =
@@ -1323,8 +1444,8 @@ spu_t *spu_Create(vlc_object_t *object, vout_thread_t *vout)
     sys->source_chain = filter_chain_New(spu, "sub source", SPU_ES);
     sys->filter_chain = filter_chain_New(spu, "sub filter", SPU_ES);
 
-    /* Load text and scale module */
-    sys->text = SpuRenderCreateAndLoadText(spu);
+    /* Load text and scale module（listener-only 时 text 为 NULL，见函数注释） */
+    sys->text = SpuRenderCreateAndLoadTextIfNeeded(spu);
 
     /* XXX spu->p_scale is used for all conversion/scaling except yuvp to
      * yuva/rgba */
@@ -1403,7 +1524,7 @@ void spu_Attach(spu_t *spu, vlc_object_t *input, bool attach)
 
         if (spu->p->text)
             FilterRelease(spu->p->text);
-        spu->p->text = SpuRenderCreateAndLoadText(spu);
+        spu->p->text = SpuRenderCreateAndLoadTextIfNeeded(spu);
 
         vlc_mutex_unlock(&spu->p->lock);
     } else {
@@ -1589,6 +1710,63 @@ subpicture_t *spu_Render(spu_t *spu,
     /* Get an array of subpictures to render */
     SpuSelectSubpictures(spu, &subpicture_count, subpicture_array,
                          render_subtitle_date, render_osd_date, ignore_osd);
+
+    /* 文本字幕桥：把当前应显示的文本回调给外部监听者（无字幕时通知清空） */
+#ifdef __ANDROID__
+    /* VLCSpuTrace: 跟踪当前被选中显示的字幕 subpicture（指针变化时打印） */
+    {
+        static subpicture_t *s_last_traced = NULL;
+        subpicture_t *p_traced = NULL;
+        for ( unsigned i = 0; i < subpicture_count && !p_traced; i++ )
+            if ( subpicture_array[i]->b_subtitle )
+                p_traced = subpicture_array[i];
+        if ( p_traced != s_last_traced )
+        {
+            s_last_traced = p_traced;
+            if ( p_traced )
+            {
+                int i_regions = 0;
+                bool b_text = false;
+                for ( subpicture_region_t *r = p_traced->p_region; r; r = r->p_next )
+                {
+                    i_regions++;
+                    if ( r->p_text )
+                        b_text = true;
+                }
+                __android_log_print( ANDROID_LOG_INFO, "VLCSpuTrace",
+                                     "select: subpic=%p order=%lld [%lld..%lld] regions=%d text=%d",
+                                     (void *)p_traced,
+                                     (long long)p_traced->i_order,
+                                     (long long)p_traced->i_start,
+                                     (long long)p_traced->i_stop,
+                                     i_regions, b_text );
+            }
+            else
+            {
+                __android_log_print( ANDROID_LOG_INFO, "VLCSpuTrace", "select: none" );
+            }
+        }
+    }
+#endif
+    {
+        vlc_mutex_lock(&spu_text_bridge.lock);
+        bool b_bridge = spu_text_bridge.pf_text != NULL;
+        vlc_mutex_unlock(&spu_text_bridge.lock);
+        if (b_bridge) {
+            subpicture_t *p_text_sub = NULL;
+            for (unsigned i = 0; i < subpicture_count && !p_text_sub; i++)
+                if (subpicture_array[i]->b_subtitle)
+                    p_text_sub = subpicture_array[i];
+            if (p_text_sub) {
+                char *psz = spu_text_bridge_text(p_text_sub);
+                spu_text_bridge_update(psz, p_text_sub->i_start, p_text_sub->i_stop);
+                free(psz);
+            } else {
+                spu_text_bridge_update("", 0, 0);
+            }
+        }
+    }
+
     if (subpicture_count <= 0) {
         vlc_mutex_unlock(&sys->lock);
         return NULL;

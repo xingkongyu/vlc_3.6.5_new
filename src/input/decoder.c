@@ -44,6 +44,10 @@
 #include <vlc_dialog.h>
 #include <vlc_modules.h>
 
+#ifdef __ANDROID__
+#include <android/log.h>
+#endif
+
 #include "audio_output/aout_internal.h"
 #include "stream_output/stream_output.h"
 #include "input_internal.h"
@@ -1261,6 +1265,10 @@ static void DecoderPlaySpu( decoder_t *p_dec, subpicture_t *p_subpic )
     if( p_subpic->i_start <= VLC_TICK_INVALID )
     {
         msg_Warn( p_dec, "non-dated spu buffer received" );
+#ifdef __ANDROID__
+        __android_log_print( ANDROID_LOG_INFO, "VLCSpuTrace",
+                             "spu subpic DROPPED: non-dated (channel=%d)", p_subpic->i_channel );
+#endif
         subpicture_Delete( p_subpic );
         return;
     }
@@ -1282,10 +1290,33 @@ static void DecoderPlaySpu( decoder_t *p_dec, subpicture_t *p_subpic )
     if( p_subpic->i_start <= VLC_TICK_INVALID
      || DecoderTimedWait( p_dec, p_subpic->i_start - SPU_MAX_PREPARE_TIME ) )
     {
+#ifdef __ANDROID__
+        __android_log_print( ANDROID_LOG_INFO, "VLCSpuTrace",
+                             "spu subpic DROPPED: flushed (start=%lld)",
+                             (long long) p_subpic->i_start );
+#endif
         subpicture_Delete( p_subpic );
         return;
     }
 
+#ifdef __ANDROID__
+    {
+        int i_regions = 0;
+        bool b_text = false;
+        for( subpicture_region_t *r = p_subpic->p_region; r; r = r->p_next )
+        {
+            i_regions++;
+            if( r->p_text )
+                b_text = true;
+        }
+        __android_log_print( ANDROID_LOG_INFO, "VLCSpuTrace",
+                             "spu subpic -> vout: order=%lld [%lld..%lld] ch=%d regions=%d text=%d",
+                             (long long) p_subpic->i_order,
+                             (long long) p_subpic->i_start,
+                             (long long) p_subpic->i_stop,
+                             p_subpic->i_channel, i_regions, b_text );
+    }
+#endif
     vout_PutSubpicture( p_vout, p_subpic );
 }
 

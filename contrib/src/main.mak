@@ -378,6 +378,7 @@ UNPACK = $(RM) -R $@ \
 	$(foreach f,$(filter %.tar.gz %.tgz,$^), && tar $(TAR_VERBOSE)xzfo $(f)) \
 	$(foreach f,$(filter %.tar.bz2,$^), && tar $(TAR_VERBOSE)xjfo $(f)) \
 	$(foreach f,$(filter %.tar.xz,$^), && tar $(TAR_VERBOSE)xJfo $(f)) \
+	$(foreach f,$(filter %.tar.zst,$^), && tar $(TAR_VERBOSE)xfo $(f)) \
 	$(foreach f,$(filter %.zip,$^), && unzip $(f) $(UNZIP_PARAMS))
 UNPACK_DIR = $(patsubst %.tar,%,$(basename $(notdir $<)))
 APPLY = (cd $(UNPACK_DIR) && patch -fp1) <
@@ -538,12 +539,12 @@ distclean: clean
 	$(RM) config.mak
 	unlink Makefile
 
-PREBUILT_URL=http://download.videolan.org/pub/videolan/contrib/$(HOST)/vlc-contrib-$(HOST)-latest.tar.bz2
+PREBUILT_URL=http://download.videolan.org/pub/videolan/contrib/$(HOST)/vlc-contrib-$(HOST)-latest.tar.zst
 
-vlc-contrib-$(HOST)-latest.tar.bz2:
+vlc-contrib-$(HOST)-latest.tar.zst:
 	$(call download,$(PREBUILT_URL))
 
-prebuilt: vlc-contrib-$(HOST)-latest.tar.bz2
+prebuilt: vlc-contrib-$(HOST)-latest.tar.zst
 	$(RM) -r $(PREFIX)
 	-$(UNPACK)
 	mv $(HOST) $(PREFIX)

@@ -232,6 +232,34 @@ VLC_API void subpicture_Update( subpicture_t *, const video_format_t *src, const
  */
 VLC_API unsigned picture_BlendSubpicture( picture_t *, filter_t *p_blend, subpicture_t * );
 
+/**
+ * 文本字幕外部渲染回调（Android 自绘场景）。
+ *
+ * 由 spu 渲染线程调用：每当"当前应显示的文本字幕"发生变化（含清空，psz_text 为 ""）
+ * 时触发一次，与显示时机完全同步。
+ *
+ * @param p_data  注册时传入的用户指针
+ * @param psz_text UTF-8 字幕文本（可能含换行）；"" 表示当前无字幕应显示
+ * @param i_start 当前字幕的显示起始时间（vlc_tick_t，微秒）
+ * @param i_stop  当前字幕的显示结束时间（0 表示未知/延续）
+ */
+typedef void (*vlc_spu_text_cb)( void *p_data, const char *psz_text,
+                                 int64_t i_start, int64_t i_stop );
+
+/**
+ * 注册/注销文本字幕监听。
+ *
+ * @param pf_text 回调函数；传 NULL 注销
+ * @param p_data  回调用户指针
+ * @param b_listener_only true 时，文本字幕只回调不上屏（由外部自绘）；
+ *                图形字幕（PGS 等，无文本）不受影响、照常上屏。
+ *                false 时仅回调，内核照常渲染。
+ *
+ * 线程安全。进程级生效（对之后创建的所有 vout/spu 生效）。
+ */
+VLC_API void vlc_spu_set_text_listener( vlc_spu_text_cb pf_text, void *p_data,
+                                        bool b_listener_only );
+
 /**@}*/
 
 #endif /* _VLC_VIDEO_H */
