@@ -142,7 +142,9 @@ contrib/src/main.mak               # tar.zst 支持
 | 2026-09 | 基线建立：字幕重叠/残影修复、文本字幕桥、FFmpeg 8 适配、smb2 适配 |
 | 2026-11-02 | 位图字幕 App 接管正式版（`vlc_spu_set_bitmap_listener`、`sub-scale`/`sub-color`） |
 | 2026-11-04 | App 侧：HE-AAC（显式 SBR）判定走 VLC；低电平增益补偿 |
-| 2026-11-05 | 系统重装后完整重建本树，补齐 `libvlc_video_set_sub_scale/color`、`es_out.c` trace，AAR 逐层比对与基线一致（仅 chromecast 模块因 protoc 版本未启用） |
+| 2026-11-05 | 系统重装后完整重建本树：补齐 `libvlc_video_set_sub_scale/color`、`es_out.c` 的 `VLCSpuTrace`、位图字幕接管（含 `b_has_last` 去重与 CLEAR 通知）、`sub-scale`/`sub-color` 变量化；AAR 逐层比对与基线一致（仅 chromecast 模块因 protoc 版本未启用）。稳定版 AAR 存于 [`aar/`](aar/README.md) |
+
+> **AAR 产物**：每个验证通过的稳定版都放在 [`aar/`](aar/README.md) 目录，含构建时间戳与基线对照，便于回滚。
 
 ---
 

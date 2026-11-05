@@ -408,6 +408,14 @@ end:
 void libvlc_video_set_sub_scale( libvlc_media_player_t *p_mi, float f_scale )
 {
     VLC_UNUSED( p_mi );
+
+    /* 在 API 层就收敛到有效区间（0.1 ~ 5.0），core 内部还会再 clamp 一次，
+     * 这样调用方拿到的一定是可用值，也便于日志/调试时判断是否被截断。 */
+    if ( f_scale < 0.1f )
+        f_scale = 0.1f;
+    else if ( f_scale > 5.f )
+        f_scale = 5.f;
+
     spu_SetUserScale( f_scale );
 }
 

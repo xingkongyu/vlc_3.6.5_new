@@ -42,6 +42,7 @@
 /* 文本/位图字幕桥与用户参数声明（VLC_API 决定符号可见性，缺了会导致
  * libvlcjni 链接时报 undefined reference） */
 #include <vlc_subpicture.h>
+#include <vlc_fourcc.h>   /* VLC_CODEC_RGBA（位图字幕回传的格式判定） */
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -162,12 +163,19 @@ static void spu_text_bridge_update( const char *psz_text,
  *****************************************************************************/
 static struct {
     vlc_mutex_t       lock;
-    float             f_scale;
-    int               i_color;
+    float             f_scale;        /* 0 = 未显式设置，回落到继承值（媒体选项） */
+    int               i_color;        /* 0 = 不重着色 */
     vlc_spu_bitmap_cb pf_bitmap;
     void             *p_bitmap_data;
     bool              b_bitmap_only;
-} spu_user_params = { VLC_STATIC_MUTEX, 1.f, 0, NULL, NULL, false };
+    bool              b_has_last;     /* 上次是否已回传内容，用于补发 CLEAR */
+} spu_user_params = { VLC_STATIC_MUTEX, 0.f, 0, NULL, NULL, false, false };
+
+#ifdef __ANDROID__
+# define SPUBMPTRACE(...) __android_log_print( ANDROID_LOG_INFO, "VLCSubBitmap", __VA_ARGS__ )
+#else
+# define SPUBMPTRACE(...) do {} while ( 0 )
+#endif
 
 void spu_SetUserScale( float f_scale )
 {
@@ -192,10 +200,167 @@ void vlc_spu_set_bitmap_listener( vlc_spu_bitmap_cb pf_bitmap, void *p_data,
                                   bool b_listener_only )
 {
     vlc_mutex_lock( &spu_user_params.lock );
+    /* 重新注册时必须清掉"上次已回传"标记：否则切轨后相同内容不再回调，
+     * App 侧会停在上一轨的旧画面上。 */
+    spu_user_params.b_has_last = false;
     spu_user_params.pf_bitmap = pf_bitmap;
     spu_user_params.p_bitmap_data = p_data;
     spu_user_params.b_bitmap_only = b_listener_only;
     vlc_mutex_unlock( &spu_user_params.lock );
+
+    SPUBMPTRACE( "bitmap listener %s (%s)",
+                 pf_bitmap ? "registered" : "cleared",
+                 b_listener_only ? "takeover" : "observe" );
+}
+
+/* 生效中的缩放：显式设置优先，否则继承 playlist / media option 的 sub-scale */
+static float SpuUserScaleGet( spu_t *spu )
+{
+    vlc_mutex_lock( &spu_user_params.lock );
+    const float f = spu_user_params.f_scale;
+    vlc_mutex_unlock( &spu_user_params.lock );
+
+    if ( f > 0.f )
+        return f;
+    return var_InheritFloat( spu, "sub-scale" );
+}
+
+static int SpuUserColorGet( void )
+{
+    vlc_mutex_lock( &spu_user_params.lock );
+    const int c = spu_user_params.i_color;
+    vlc_mutex_unlock( &spu_user_params.lock );
+    return c;
+}
+
+/**
+ * 把渲染完成的位图 region 回传给外部（App 用 ImageView 绘制）。
+ *
+ * @return true  已接管，调用方不要再上屏（输出已被消费）
+ *         false 未接管，按内置渲染正常上屏
+ *
+ * 只在「注册了回调 + listener_only」且所有 region 都是 RGBA 时才接管；
+ * 遇到其它 chroma 主动放弃，宁可退化到内置渲染，也不能出现"接管了却画不出来"。
+ */
+static bool SpuBitmapBridgeNotify( spu_t *spu, subpicture_t *p_output )
+{
+    vlc_mutex_lock( &spu_user_params.lock );
+    vlc_spu_bitmap_cb pf = spu_user_params.pf_bitmap;
+    void *p_data = spu_user_params.p_bitmap_data;
+    const bool b_only = spu_user_params.b_bitmap_only;
+    bool b_has_last = spu_user_params.b_has_last;
+    vlc_mutex_unlock( &spu_user_params.lock );
+
+    if ( !pf || !b_only )
+        return false;
+
+    int i_count = 0;
+    for ( subpicture_region_t *r = p_output ? p_output->p_region : NULL;
+          r; r = r->p_next )
+    {
+        if ( !r->p_picture )
+            continue;
+        if ( r->fmt.i_chroma != VLC_CODEC_RGBA )
+            return false;
+        i_count++;
+    }
+
+    if ( i_count == 0 )
+    {
+        /* 无内容：通知外部清空（仅在上次确实有内容时发，避免重复 CLEAR） */
+        if ( b_has_last )
+        {
+            vlc_mutex_lock( &spu_user_params.lock );
+            spu_user_params.b_has_last = false;
+            vlc_mutex_unlock( &spu_user_params.lock );
+
+            SPUBMPTRACE( "bitmap clear: notify external to hide subtitle" );
+            pf( p_data, 0, NULL, NULL, 0, 0, 0, 0 );
+        }
+        return p_output != NULL;
+    }
+
+    const int i_video_w = p_output->i_original_picture_width;
+    const int i_video_h = p_output->i_original_picture_height;
+
+    const uint8_t **pp_rgba = vlc_alloc( i_count, sizeof(*pp_rgba) );
+    int *p_rects = vlc_alloc( (size_t) i_count * 4, sizeof(int) );
+    if ( !pp_rgba || !p_rects )
+    {
+        free( pp_rgba );
+        free( p_rects );
+        return false;
+    }
+
+    const int i_color = SpuUserColorGet();
+    const int i_r = ( i_color >> 16 ) & 0xff;
+    const int i_g = ( i_color >>  8 ) & 0xff;
+    const int i_b =   i_color         & 0xff;
+
+    int n = 0;
+    for ( subpicture_region_t *r = p_output->p_region; r && n < i_count; r = r->p_next )
+    {
+        if ( !r->p_picture )
+            continue;
+        picture_t *pic = r->p_picture;
+        const int w = pic->format.i_width;
+        const int h = pic->format.i_height;
+        if ( w <= 0 || h <= 0 )
+            continue;
+
+        uint8_t *buf = malloc( (size_t) w * h * 4 );
+        if ( !buf )
+            break;
+
+        for ( int y = 0; y < h; y++ )
+        {
+            const uint8_t *src = pic->p[0].p_pixels + (size_t) y * pic->p[0].i_pitch;
+            uint8_t *dst = buf + (size_t) y * w * 4;
+            if ( i_color == 0 )
+            {
+                memcpy( dst, src, (size_t) w * 4 );
+            }
+            else
+            {   /* 用原 alpha 作遮罩替换 RGB（0xAARRGGBB） */
+                for ( int x = 0; x < w; x++ )
+                {
+                    dst[0] = (uint8_t) i_r;
+                    dst[1] = (uint8_t) i_g;
+                    dst[2] = (uint8_t) i_b;
+                    dst[3] = src[3];
+                    src += 4;
+                    dst += 4;
+                }
+            }
+        }
+
+        pp_rgba[n] = buf;
+        p_rects[n * 4 + 0] = r->i_x;   /* 位置在 region 上，不在 fmt 里 */
+        p_rects[n * 4 + 1] = r->i_y;
+        p_rects[n * 4 + 2] = w;
+        p_rects[n * 4 + 3] = h;
+        n++;
+    }
+
+    if ( n == 0 )
+    {
+        free( pp_rgba );
+        free( p_rects );
+        return false;
+    }
+
+    vlc_mutex_lock( &spu_user_params.lock );
+    spu_user_params.b_has_last = true;
+    vlc_mutex_unlock( &spu_user_params.lock );
+
+    pf( p_data, n, pp_rgba, p_rects, i_video_w, i_video_h,
+        p_output->i_start, p_output->i_stop );
+
+    for ( int i = 0; i < n; i++ )
+        free( (void *) pp_rgba[i] );
+    free( pp_rgba );
+    free( p_rects );
+    return true;
 }
 
 /*****************************************************************************
@@ -1196,7 +1361,11 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
         region_count += count;
     }
     if (region_count <= 0)
+    {
+        /* 当前没有可显示的字幕：若外部正在接管，通知其清空画面 */
+        SpuBitmapBridgeNotify( spu, NULL );
         return NULL;
+    }
 
     /* Create the output subpicture */
     subpicture_t *output = subpicture_New(NULL);
@@ -1316,6 +1485,15 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
     /* */
     if (subtitle_area != subtitle_area_buffer)
         free(subtitle_area);
+
+    /* 位图字幕接管：把 RGBA region 回传给外部后丢弃，不再上屏。
+     * （4K 下这条独立 RGBA Surface 是掉帧的主要来源，接管后由 App 用
+     *  ImageView 画在 UI 层，内核不再参与合成。） */
+    if ( SpuBitmapBridgeNotify( spu, output ) )
+    {
+        subpicture_Delete( output );
+        return NULL;
+    }
 
     return output;
 }
@@ -1499,6 +1677,26 @@ spu_t *spu_Create(vlc_object_t *object, vout_thread_t *vout)
     vlc_mutex_init(&sys->filter_chain_lock);
     sys->source_chain = filter_chain_New(spu, "sub source", SPU_ES);
     sys->filter_chain = filter_chain_New(spu, "sub filter", SPU_ES);
+
+    /* 位图字幕参数：同时暴露成 VLC 变量，带 VLC_VAR_DOINHERIT 后
+     * playlist 上的 media option（:sub-scale= / :sub-color=）会被继承到
+     * SpuUserScaleGet / SpuUserColorGet。 */
+    {
+        vlc_value_t text;
+
+        var_Create( spu, "sub-scale", VLC_VAR_FLOAT | VLC_VAR_DOINHERIT );
+        text.psz_string = (char *) "Bitmap subtitle scale";
+        var_Change( spu, "sub-scale", VLC_VAR_SETTEXT, &text, NULL );
+        msg_Dbg( spu, "sub-scale: Scale factor applied to bitmap (non-text) subtitles. "
+                      "1.0 is the original size; the anchor stays centered." );
+
+        var_Create( spu, "sub-color", VLC_VAR_INTEGER | VLC_VAR_DOINHERIT );
+        text.psz_string = (char *) "Bitmap subtitle color";
+        var_Change( spu, "sub-color", VLC_VAR_SETTEXT, &text, NULL );
+        msg_Dbg( spu, "sub-color: ARGB color (0xAARRGGBB) applied to bitmap (non-text) "
+                      "subtitles; the original alpha is used as a mask. "
+                      "0 disables recoloring." );
+    }
 
     /* Load text and scale module（listener-only 时 text 为 NULL，见函数注释） */
     sys->text = SpuRenderCreateAndLoadTextIfNeeded(spu);
