@@ -1,0 +1,155 @@
+--- before/VlcVideo.java
++++ after/VlcVideo.java
+@@ -285,8 +285,11 @@
+                                       long startMs, long stopMs) {
+             /* 取一次"发起时"的代际快照：本回调跑在 vout 线程，此刻的 gen 就是
+              * 这批数据所属的那一代。下面 worker / 主线程执行时若 gen 变了
+              * （用户切轨了），说明这批数据已过期，直接丢弃。 */
++            // 最外层防线：本回调跑在 vout 线程，任何未捕获异常都可能打断播放线程。
++            // 为缩小 diff，内部保持原缩进，只补结构行。
++            try {
+             final int gen = mSubtitleGen.get();
+ 
+             // 本回调跑在 vout 线程（且持有 spu 锁）：只做轻量转发，绝不做逐像素处理。
+             final Handler worker = mBitmapWorker;
+@@ -303,29 +306,40 @@
+              *   34.428 转换完的绘制任务才执行 → 又把字幕画回来 ✗
+              * 走同一队列后顺序是「回调 → clear」，clear 最后生效 ✓ */
+             if (rgba == null || rects == null || rgba.length == 0 || rects.length < 4) {
+                 worker.post(() -> {
+-                    if (mSubtitleGen.get() != gen) {
+-                        return;   // 期间切轨了 → 丢弃这条过期的清空通知
+-                    }
+-                    mSubtitleHandler.post(() -> {
+-                        try {
+-                            if (mSubtitleGen.get() != gen) {
+-                                return;
++                    try {
++                        if (mSubtitleGen.get() != gen) {
++                            return;   // 期间切轨了 → 丢弃这条过期的清空通知
++                        }
++                        final Handler mainHandler = mSubtitleHandler;
++                        if (mainHandler == null) {
++                            logShow(TAG, "bitmap clear DROPPED: main handler not started");
++                            return;
++                        }
++                        mainHandler.post(() -> {
++                            try {
++                                if (mSubtitleGen.get() != gen) {
++                                    return;
++                                }
++                                if (mDestroyed || !mAppBitmapSubtitleMode) {
++                                    return;
++                                }
++                                logShow(TAG, "bitmap cb: CLEAR (rgba="
++                                        + (rgba == null ? "null" : String.valueOf(rgba.length))
++                                        + " rects=" + (rects == null ? "null" : String.valueOf(rects.length))
++                                        + ") -> hide");
++                                hideBitmapSubtitle();
++                            } catch (Throwable t) {
++                                // 主线程未捕获异常会直接崩 App，这里兜住
++                                logShow(TAG, "bitmap clear FAILED: " + t);
+                             }
+-                            if (mDestroyed || !mAppBitmapSubtitleMode) {
+-                                return;
+-                            }
+-                            logShow(TAG, "bitmap cb: CLEAR (rgba="
+-                                    + (rgba == null ? "null" : String.valueOf(rgba.length))
+-                                    + " rects=" + (rects == null ? "null" : String.valueOf(rects.length))
+-                                    + ") -> hide");
+-                            hideBitmapSubtitle();
+-                        } catch (Throwable t) {
+-                            // 主线程未捕获异常会直接崩 App，这里兜住
+-                            logShow(TAG, "bitmap clear FAILED: " + t);
+-                        }
+-                    });
++                        });
++                    } catch (Throwable t) {
++                        // 后台 Runnable 抛异常会终止 HandlerThread 的 Looper，
++                        // 之后所有位图字幕都不再刷新且无任何报错，必须兜住
++                        logShow(TAG, "bitmap clear worker FAILED: " + t);
++                    }
+                 });
+                 return;
+             }
+ 
+@@ -334,38 +348,52 @@
+             //  - 后台线程的 Runnable 抛异常会**终止 HandlerThread 的 Looper**，
+             //    之后所有位图字幕都不再刷新，且不会有任何报错（极难排查）；
+             //  - 主线程的 Runnable 抛异常会直接 **UncaughtException 崩掉 App**。
+             worker.post(() -> {
+-                if (mSubtitleGen.get() != gen) {
+-                    return;   // 期间切轨了 → 不值得再转换
+-                }
+-                final Bitmap[] bitmaps;
+                 try {
+-                    bitmaps = buildBitmapArray(rgba, rects);
++                    if (mSubtitleGen.get() != gen) {
++                        return;   // 期间切轨了 → 不值得再转换
++                    }
++                    final Bitmap[] bitmaps;
++                    try {
++                        bitmaps = buildBitmapArray(rgba, rects);
++                    } catch (Throwable t) {
++                        logShow(TAG, "buildBitmapArray FAILED: " + t);
++                        return;
++                    }
++                    final Handler mainHandler = mSubtitleHandler;
++                    if (mainHandler == null) {
++                        logShow(TAG, "bitmap cb DROPPED: main handler not started");
++                        return;
++                    }
++                    mainHandler.post(() -> {
++                        try {
++                            if (mSubtitleGen.get() != gen) {
++                                return;   // 期间切轨了 → 丢弃，别把旧字幕画回去
++                            }
++                            if (mDestroyed || !mAppBitmapSubtitleMode || mBitmapSubtitleContainer == null) {
++                                logShow(TAG, "bitmap cb DROPPED: destroyed=" + mDestroyed
++                                        + " appTakeOver=" + mAppBitmapSubtitleMode
++                                        + " container=" + (mBitmapSubtitleContainer != null));
++                                return;
++                            }
++                            logShow(TAG, "bitmap cb: " + rgba.length + " region(s), video="
++                                    + videoWidth + "x" + videoHeight
++                                    + ", start=" + startMs + " stop=" + stopMs);
++                            applyBitmapArray(bitmaps, rects, videoWidth, videoHeight);
++                        } catch (Throwable t) {
++                            logShow(TAG, "applyBitmapArray FAILED: " + t);
++                        }
++                    });
+                 } catch (Throwable t) {
+-                    logShow(TAG, "buildBitmapArray FAILED: " + t);
+-                    return;
+-                }
+-                mSubtitleHandler.post(() -> {
+-                    try {
+-                        if (mSubtitleGen.get() != gen) {
+-                            return;   // 期间切轨了 → 丢弃，别把旧字幕画回去
+-                        }
+-                        if (mDestroyed || !mAppBitmapSubtitleMode || mBitmapSubtitleContainer == null) {
+-                            logShow(TAG, "bitmap cb DROPPED: destroyed=" + mDestroyed
+-                                    + " appTakeOver=" + mAppBitmapSubtitleMode
+-                                    + " container=" + (mBitmapSubtitleContainer != null));
+-                            return;
+-                        }
+-                        logShow(TAG, "bitmap cb: " + rgba.length + " region(s), video="
+-                                + videoWidth + "x" + videoHeight
+-                                + ", start=" + startMs + " stop=" + stopMs);
+-                        applyBitmapArray(bitmaps, rects, videoWidth, videoHeight);
+-                    } catch (Throwable t) {
+-                        logShow(TAG, "applyBitmapArray FAILED: " + t);
+-                    }
+-                });
++                    // 同上：不能让后台 Looper 因单个异常停摆
++                    logShow(TAG, "bitmap worker FAILED: " + t);
++                }
+             });
++            } catch (Throwable t) {
++                // core 的回调线程不能被 App 侧异常打断，否则整条字幕/渲染链停摆
++                logShow(TAG, "onSubtitleBitmaps FAILED: " + t);
++            }
+         }
+     };
+ 
+     public VlcVideo(@NonNull Context context) {

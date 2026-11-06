@@ -955,6 +955,11 @@ error:
 static void SubtitleRegionToBounds(subpicture_t *subpicture,
                                    ARect *p_out_bounds)
 {
+    /* subpicture 非空但没有 region（字幕结束的清屏事件）时循环不执行，
+     * 不先置空就会把未定义的栈值当成矩形使用。 */
+    p_out_bounds->left = p_out_bounds->top = 0;
+    p_out_bounds->right = p_out_bounds->bottom = 0;
+
     if (subpicture) {
         for (subpicture_region_t *r = subpicture->p_region; r != NULL; r = r->p_next) {
             ARect new_bounds;
@@ -986,17 +991,111 @@ static void SubtitleRegionToBounds(subpicture_t *subpicture,
     }
 }
 
-/* 字幕 surface 是多缓冲轮转的：全局的 b_sub_on_surface / surface_region 无法
- * 准确描述"当前锁到的 buffer 里残留了哪块旧字幕"。旧版基于 per-buffer dirty
- * bounds 的区域清除在缓冲轮转时会出现 bounds 为空但像素残留的情况（CLEAR
- * rect=[0,0..0,0]，新字幕直接叠画在旧字幕上 → 重叠/残影）。
- * 因此改为：凡是需要重绘，一律清除整个字幕 surface。重绘只发生在字幕内容
- * 变化时（约 1~2 次/秒），全屏 memset 的开销可以忽略；SKIP 帧仍然整体跳过。 */
+/* 取两个矩形的并集（空矩形不参与）。 */
+static void SubRectUnion(ARect *p_dst, const ARect *p_src)
+{
+    if (p_src->right <= p_src->left || p_src->bottom <= p_src->top)
+        return; /* 空矩形 */
+
+    if (p_dst->right <= p_dst->left || p_dst->bottom <= p_dst->top) {
+        *p_dst = *p_src; /* 目标为空，直接取源 */
+        return;
+    }
+    if (p_src->left < p_dst->left)
+        p_dst->left = p_src->left;
+    if (p_src->top < p_dst->top)
+        p_dst->top = p_src->top;
+    if (p_src->right > p_dst->right)
+        p_dst->right = p_src->right;
+    if (p_src->bottom > p_dst->bottom)
+        p_dst->bottom = p_src->bottom;
+}
+
+/* 字幕 surface 的像素直接指向 ANativeWindow 的 buffer（见
+ * AndroidWindow_LockPicture），SurfaceFlinger 轮转 buffer 时，新锁定的 buffer
+ * 上可能还留着更早一帧画过的字幕像素。因此要按 buffer 分别记住"上次画进去
+ * 的区域"，下次锁定同一个 buffer 时先把这块区域擦掉。
+ *
+ * 上游 3.0.x 的 SubtitleGetDirtyBounds() 用的就是这个办法，但它在找不到对应
+ * buffer 时回退成"整幅画面"清除：4K 下一次 memset 3840*2160*4 = 33MB（实测
+ * 约 40ms），字幕一出现就把视频帧拖成 "picture is too late to be displayed"。
+ * 这里把回退改成空矩形——找不到记录说明这个 buffer 从没被画过，本来就没有
+ * 残留像素，不需要清。 */
+static void SubtitleBufferBoundsGet(vout_display_sys_t *sys, ARect *p_out)
+{
+    p_out->left = p_out->top = p_out->right = p_out->bottom = 0;
+
+    if (!sys->p_sub_buffer_bounds || !sys->p_sub_pic)
+        return;
+
+    for (int i = 0; sys->p_sub_buffer_bounds[i].p_pixels != NULL; i++)
+        if (sys->p_sub_buffer_bounds[i].p_pixels == sys->p_sub_pic->p[0].p_pixels) {
+            *p_out = sys->p_sub_buffer_bounds[i].bounds;
+            return;
+        }
+}
+
+/* 记录当前 buffer 的内容范围（p_bounds 为 NULL 表示已擦干净）。 */
+static void SubtitleBufferBoundsSet(vout_display_sys_t *sys, const ARect *p_bounds)
+{
+    if (!sys->p_sub_pic)
+        return;
+
+    uint8_t *p_pixels = sys->p_sub_pic->p[0].p_pixels;
+    int i = 0;
+
+    if (sys->p_sub_buffer_bounds)
+        for (; sys->p_sub_buffer_bounds[i].p_pixels != NULL; i++)
+            if (sys->p_sub_buffer_bounds[i].p_pixels == p_pixels)
+                break;
+
+    if (!sys->p_sub_buffer_bounds
+     || sys->p_sub_buffer_bounds[i].p_pixels == NULL) {
+        /* 表里条目数理论上是"同时存在的 surface buffer 数"（2~3 个），但
+         * SurfaceFlinger 回收后可能把地址复用给别的 buffer，地址种类不会
+         * 无界增长。这里仍加个上限兜底：超限时整表重置（最坏情况只是多清
+         * 一次，绝不会越界）。 */
+        if (i >= 16) {
+            free(sys->p_sub_buffer_bounds);
+            sys->p_sub_buffer_bounds = NULL;
+            i = 0;
+        }
+        buffer_bounds *p_bb = realloc(sys->p_sub_buffer_bounds,
+                                      (i + 2) * sizeof(buffer_bounds));
+        if (!p_bb)
+            return;
+        sys->p_sub_buffer_bounds = p_bb;
+        sys->p_sub_buffer_bounds[i].p_pixels = p_pixels;
+        sys->p_sub_buffer_bounds[i + 1].p_pixels = NULL;
+    }
+
+    if (p_bounds)
+        sys->p_sub_buffer_bounds[i].bounds = *p_bounds;
+    else
+        sys->p_sub_buffer_bounds[i].bounds.left =
+        sys->p_sub_buffer_bounds[i].bounds.top =
+        sys->p_sub_buffer_bounds[i].bounds.right =
+        sys->p_sub_buffer_bounds[i].bounds.bottom = 0;
+}
+
+/* 字幕清除策略：清除范围 = 该 buffer 上次画过的区域 ∪ 本帧要绘制的区域。
+ *
+ * 演进过程（三个版本各踩一个坑）：
+ *  1) 最早按 per-buffer dirty bounds 清除：缓冲轮转时会算出空矩形
+ *     （CLEAR rect=[0,0..0,0]），旧字幕像素残留，新字幕直接叠画 → 重叠/残影。
+ *  2) 后来改成"凡是需要重绘一律整屏 memset"：不再残留，但 4K 下单次要
+ *     memset 3840*2160*4 = 33MB（实测约 40ms），字幕一出现就把视频帧拖成
+ *     "picture is too late to be displayed"（实测 missing 111/76/49/25ms，
+ *     连续丢 4 帧），观感是"字幕一出来画面就卡"。
+ *  3) 现在按 buffer 记录"上次画过的区域"，清除范围 = 该 buffer 的残留区域
+ *     ∪ 本帧要绘制的区域：既保证旧像素被擦净，清除面积又只限字幕行本身。
+ * SKIP 帧仍然整体跳过（内容没变，无需重绘）。 */
 
 static void SubpicturePrepare(vout_display_t *vd, subpicture_t *subpicture)
 {
     vout_display_sys_t *sys = vd->sys;
     ARect memset_bounds;
+    ARect clear_bounds;
 
     SubtitleRegionToBounds(subpicture, &memset_bounds);
 
@@ -1042,33 +1141,69 @@ static void SubpicturePrepare(vout_display_t *vd, subpicture_t *subpicture)
     if( !subpicture && !sys->b_sub_on_surface )
         return; /* nothing new to draw and nothing to erase */
 
+    /* 空区域（位图字幕由外部接管时拿到的"空壳" subpicture）且屏幕上没有
+     * 残留：既不用画也不用清，直接返回。否则会白白 dequeue/lock 一次 4K
+     * 字幕 Surface（33MB buffer），实测每次字幕出现都让 vout 线程落后约
+     * 250ms —— 字幕一出现就卡的主因之一。 */
+    if( subpicture
+     && memset_bounds.left >= memset_bounds.right
+     && memset_bounds.top  >= memset_bounds.bottom
+     && !sys->b_sub_on_surface )
+        return;
+
     if (AndroidWindow_LockPicture(sys, sys->p_sub_window, sys->p_sub_pic) != 0)
         return;
 
-    /* Clear the whole subtitles surface (see the comment above the function:
-     * per-buffer region tracking is unreliable across buffer rotations). */
-    memset_bounds.left = 0;
-    memset_bounds.top = 0;
-    memset_bounds.right = sys->p_sub_pic->format.i_width;
-    memset_bounds.bottom = sys->p_sub_pic->format.i_height;
+    /* 清除范围 = 该 buffer 上次画过的区域 ∪ 本帧要绘制的区域。
+     * 只清本帧区域，buffer 轮转后会残留旧字幕（叠画/残影）；整屏 memset
+     * 又太贵（4K 下 33MB/次，见上方注释）。取并集：擦净旧像素，且清除
+     * 面积只限字幕行本身。 */
+    SubtitleBufferBoundsGet(sys, &clear_bounds);
+    if (subpicture)
+        SubRectUnion(&clear_bounds, &memset_bounds);
 
-    SUBFIX_LOG("CLEAR full rect=[%d,%d..%d,%d]",
-               memset_bounds.left, memset_bounds.top,
-               memset_bounds.right, memset_bounds.bottom);
+    /* 裁剪到字幕 surface 范围内，避免越界 memset。region 坐标来自解码器，
+     * 可能为负、可能超出画面；i_x 为负且可见宽度为 0 时 right/bottom 会
+     * 算出负值，所以上下界都要夹住。 */
+    if (clear_bounds.left < 0)
+        clear_bounds.left = 0;
+    if (clear_bounds.top < 0)
+        clear_bounds.top = 0;
+    if (clear_bounds.right > (int)sys->p_sub_pic->format.i_width)
+        clear_bounds.right = sys->p_sub_pic->format.i_width;
+    if (clear_bounds.bottom > (int)sys->p_sub_pic->format.i_height)
+        clear_bounds.bottom = sys->p_sub_pic->format.i_height;
+    if (clear_bounds.bottom > sys->p_sub_pic->p[0].i_lines)
+        clear_bounds.bottom = sys->p_sub_pic->p[0].i_lines;
+    if (clear_bounds.right < 0)
+        clear_bounds.right = 0;
+    if (clear_bounds.bottom < 0)
+        clear_bounds.bottom = 0;
+    if (clear_bounds.left > clear_bounds.right)
+        clear_bounds.left = clear_bounds.right;
+    if (clear_bounds.top > clear_bounds.bottom)
+        clear_bounds.top = clear_bounds.bottom;
 
-    if (memset_bounds.right > memset_bounds.left
-     && memset_bounds.bottom > memset_bounds.top) {
-        const int x_pixels_offset = memset_bounds.left
+    SUBFIX_LOG("CLEAR rect=[%d,%d..%d,%d]",
+               clear_bounds.left, clear_bounds.top,
+               clear_bounds.right, clear_bounds.bottom);
+
+    if (clear_bounds.right > clear_bounds.left
+     && clear_bounds.bottom > clear_bounds.top) {
+        const int x_pixels_offset = clear_bounds.left
                                     * sys->p_sub_pic->p[0].i_pixel_pitch;
-        const int i_line_size = (memset_bounds.right - memset_bounds.left)
+        const int i_line_size = (clear_bounds.right - clear_bounds.left)
                                 * sys->p_sub_pic->p->i_pixel_pitch;
-        for (int y = memset_bounds.top; y < memset_bounds.bottom; y++)
+        for (int y = clear_bounds.top; y < clear_bounds.bottom; y++)
             memset(&sys->p_sub_pic->p[0].p_pixels[y * sys->p_sub_pic->p[0].i_pitch
-                                                  + x_pixels_offset], 0, i_line_size);
+                                             + x_pixels_offset], 0, i_line_size);
     }
 
     if (subpicture)
         picture_BlendSubpicture(sys->p_sub_pic, sys->p_spu_blend, subpicture);
+
+    /* 记住这个 buffer 现在画了什么，下次锁定它时先擦掉 */
+    SubtitleBufferBoundsSet(sys, subpicture ? &memset_bounds : NULL);
 
     sys->b_sub_on_surface = subpicture != NULL;
     if (subpicture)

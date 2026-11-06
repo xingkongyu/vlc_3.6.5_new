@@ -152,14 +152,9 @@ static void spu_text_bridge_update( const char *psz_text,
  * 由 libvlcjni 通过 MediaPlayer.setSubtitleScale / setSubtitleColor /
  * setSubtitleBitmapListener 下发。参数是进程级（App 只用一个 LibVLC 实例）。
  *
- * 当前版本只做"接收与保存"：
- *  - 缩放/颜色尚未在 SpuRenderRegion 渲染路径上生效（接入点已留好：
- *    在 SpuRenderSubpictures 里读取 f_scale 调整 region scale，
- *    渲染后按 i_color 重着色）；
- *  - 位图回传回调已可注册，但 core 尚未主动回调（接管模式未启用，
- *    此时位图字幕仍由 VLC 内置渲染上屏，行为与未注册时一致）。
- * 这样可保证 AAR 的 API 全部存在、App 无需改动即可运行，
- * 且不会因未验证的渲染改动破坏字幕显示。
+ * 位图字幕接管（b_bitmap_only）时，core 把渲染好的 RGBA region 回传给 App，
+ * 不再上屏；i_last_* 记录上一次回传的字幕身份，用于避免 spu_Render 每帧
+ * 重复执行 SpuRenderRegion（见 SpuRenderSubpictures 里的同句跳过）。
  *****************************************************************************/
 static struct {
     vlc_mutex_t       lock;
@@ -169,7 +164,10 @@ static struct {
     void             *p_bitmap_data;
     bool              b_bitmap_only;
     bool              b_has_last;     /* 上次是否已回传内容，用于补发 CLEAR */
-} spu_user_params = { VLC_STATIC_MUTEX, 0.f, 0, NULL, NULL, false, false };
+    int64_t           i_last_order;   /* 上次回传字幕的身份（同句去重） */
+    int64_t           i_last_start;
+    int64_t           i_last_stop;
+} spu_user_params = { VLC_STATIC_MUTEX, 0.f, 0, NULL, NULL, false, false, 0, 0, 0 };
 
 #ifdef __ANDROID__
 # define SPUBMPTRACE(...) __android_log_print( ANDROID_LOG_INFO, "VLCSubBitmap", __VA_ARGS__ )
@@ -223,6 +221,9 @@ void vlc_spu_set_bitmap_listener( vlc_spu_bitmap_cb pf_bitmap, void *p_data,
     /* 重新注册时必须清掉"上次已回传"标记：否则切轨后相同内容不再回调，
      * App 侧会停在上一轨的旧画面上。 */
     spu_user_params.b_has_last = false;
+    spu_user_params.i_last_order = 0;
+    spu_user_params.i_last_start = 0;
+    spu_user_params.i_last_stop  = 0;
     spu_user_params.pf_bitmap = pf_bitmap;
     spu_user_params.p_bitmap_data = p_data;
     spu_user_params.b_bitmap_only = b_listener_only;
@@ -292,6 +293,9 @@ static bool SpuBitmapBridgeNotify( spu_t *spu, subpicture_t *p_output )
         {
             vlc_mutex_lock( &spu_user_params.lock );
             spu_user_params.b_has_last = false;
+            spu_user_params.i_last_order = 0;
+            spu_user_params.i_last_start = 0;
+            spu_user_params.i_last_stop  = 0;
             vlc_mutex_unlock( &spu_user_params.lock );
 
             SPUBMPTRACE( "bitmap clear: notify external to hide subtitle" );
@@ -371,6 +375,9 @@ static bool SpuBitmapBridgeNotify( spu_t *spu, subpicture_t *p_output )
 
     vlc_mutex_lock( &spu_user_params.lock );
     spu_user_params.b_has_last = true;
+    spu_user_params.i_last_order = p_output->i_order;
+    spu_user_params.i_last_start = p_output->i_start;
+    spu_user_params.i_last_stop  = p_output->i_stop;
     vlc_mutex_unlock( &spu_user_params.lock );
 
     pf( p_data, n, pp_rgba, p_rects, i_video_w, i_video_h,
@@ -1387,6 +1394,16 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
         return NULL;
     }
 
+    /* 位图字幕是否由外部接管。spu_Render() 是逐帧调用的，接管模式下
+     * 同一句字幕只需渲染/回传一次；不去重会每帧重跑 SpuRenderRegion
+     * （YUVP->RGBA 转换 + 缩放），4K/PGS 实测单次 70~160ms。 */
+    bool b_bitmap_takeover = false;
+    vlc_mutex_lock( &spu_user_params.lock );
+    b_bitmap_takeover = spu_user_params.pf_bitmap != NULL
+                     && spu_user_params.b_bitmap_only;
+    vlc_mutex_unlock( &spu_user_params.lock );
+    bool b_skipped_subtitle = false;
+
     /* Create the output subpicture */
     subpicture_t *output = subpicture_New(NULL);
     if (!output)
@@ -1414,6 +1431,25 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
         if (!subpic->p_region)
             continue;
 
+        /* 接管模式：与上次回传的是同一句字幕 ⇒ 整条跳过渲染。
+         * 外部（App）已持有上一帧的位图，跳过是安全的；但必须记住
+         * "本帧是因去重跳过"，末尾绝不能因此补发 CLEAR。 */
+        if (subpic->b_subtitle && b_bitmap_takeover)
+        {
+            bool b_same = false;
+            vlc_mutex_lock( &spu_user_params.lock );
+            b_same = spu_user_params.b_has_last
+                  && spu_user_params.i_last_order == subpic->i_order
+                  && spu_user_params.i_last_start == subpic->i_start
+                  && spu_user_params.i_last_stop  == subpic->i_stop;
+            vlc_mutex_unlock( &spu_user_params.lock );
+            if (b_same)
+            {
+                b_skipped_subtitle = true;
+                continue;
+            }
+        }
+
         if (subpic->i_original_picture_width  <= 0 ||
             subpic->i_original_picture_height <= 0) {
             if (subpic->i_original_picture_width  > 0 ||
@@ -1426,6 +1462,19 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
 
             subpic->i_original_picture_width  = fmt_src->i_visible_width;
             subpic->i_original_picture_height = fmt_src->i_visible_height;
+        }
+
+        /* 接管模式不做缩放（见下方 scale = spu_scale_unit()），坐标与尺寸
+         * 都落在"字幕原始分辨率"坐标系：回传给 App 的基准尺寸、以及用于
+         * 去重的字幕身份都必须取当前 subpic，不能用 fmt_dst（4K）或
+         * subpicture_New 出来的默认值。 */
+        if (subpic->b_subtitle && b_bitmap_takeover)
+        {
+            output->i_order = subpic->i_order;
+            output->i_start = subpic->i_start;
+            output->i_stop  = subpic->i_stop;
+            output->i_original_picture_width  = subpic->i_original_picture_width;
+            output->i_original_picture_height = subpic->i_original_picture_height;
         }
 
         /* 文本字幕只回调不上屏（外部自绘）：跳过纯文本 subpicture */
@@ -1475,6 +1524,13 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
                                                   fmt_dst->i_visible_height,
                                                   subpic->i_original_picture_height);
 
+            /* PGS 原生多为 1080p，视频可能是 4K，上面算出的 scale 就是 2 倍
+             * 放大。SpuRenderRegion 走通用 swscale，实测单条字幕 70~160ms，
+             * 直接把 vout 线程拖成 "picture is too late"。接管模式由 App 的
+             * ImageView 用 GPU 放大，core 不做缩放，只保留必要的色度转换。 */
+            if (subpic->b_subtitle && b_bitmap_takeover)
+                scale = spu_scale_unit();
+
             /* Check scale validity */
             if (scale.w <= 0 || scale.h <= 0)
                 continue;
@@ -1505,6 +1561,16 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
     /* */
     if (subtitle_area != subtitle_area_buffer)
         free(subtitle_area);
+
+    /* 本帧的字幕都因"与上次同一句"被跳过：字幕仍在显示，既不用重绘，
+     * 也不能触发 SpuBitmapBridgeNotify 的 CLEAR 分支（否则 App 先隐藏再
+     * 重画，表现为闪烁）。同时不能把同帧残留的 OSD region 当作字幕回传，
+     * 所以整个 output 直接丢弃。 */
+    if (b_skipped_subtitle)
+    {
+        subpicture_Delete( output );
+        return NULL;
+    }
 
     /* 位图字幕接管：把 RGBA region 回传给外部后丢弃，不再上屏。
      * （4K 下这条独立 RGBA Surface 是掉帧的主要来源，接管后由 App 用
