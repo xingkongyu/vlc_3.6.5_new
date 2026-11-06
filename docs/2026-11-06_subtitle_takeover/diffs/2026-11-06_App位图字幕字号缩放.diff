@@ -1,0 +1,92 @@
+﻿diff --git a/app/src/main/java/com/hhhc/mediacenter/VideoActivity2.java b/app/src/main/java/com/hhhc/mediacenter/VideoActivity2.java
+index 87075aa2..737ae0aa 100644
+--- a/app/src/main/java/com/hhhc/mediacenter/VideoActivity2.java
++++ b/app/src/main/java/com/hhhc/mediacenter/VideoActivity2.java
+@@ -642,7 +642,18 @@ public class VideoActivity2 extends BaseActivity {
+             @Override
+             public int getSubtitleSize() {
+                 int i = (Integer) SharedPreferencesUtil.getValue(VideoActivity2.this, M.SPN, M.SP_KEY_VIDEO_SUBSIZE, 1);
+-                return 16 + i * 8;
++                // 与 VlcVideo.setSubtitleSize() / set_subsize() 的档位映射保持一致。
++                // 位图字幕缩放以 36sp 为原始大小(1.0)，若沿用旧的 16+i*8，
++                // 默认档会返回 24 并被换算成 0.67 倍，开播即把字幕缩小三分之一。
++                switch (i) {
++                    case 0: return 24;
++                    case 2: return 48;
++                    case 3: return 60;
++                    case 4: return 70;
++                    case 5: return 80;
++                    case 6: return 90;
++                    default: return 36;
++                }
+             }
+ 
+ 
+diff --git a/vlc/src/main/java/com/hhhc/vlc/VlcVideo.java b/vlc/src/main/java/com/hhhc/vlc/VlcVideo.java
+index 4c3fe2c6..e0b3975e 100644
+--- a/vlc/src/main/java/com/hhhc/vlc/VlcVideo.java
++++ b/vlc/src/main/java/com/hhhc/vlc/VlcVideo.java
+@@ -2965,12 +2965,32 @@ public class VlcVideo extends FrameLayout {
+ 
+         final float sx = (float) viewW / (float) videoWidth;
+         final float sy = (float) viewH / (float) videoHeight;
++        // 用户字号缩放：字幕接管后由本控件的 ImageView 绘制，core 的 sub-scale 不会
++        // 作用到回传位图，必须在这里把 mSubtitleBitmapScale 应用到尺寸与坐标上。
++        final float userScale = mSubtitleBitmapScale > 0f ? mSubtitleBitmapScale : 1.0f;
+ 
+         // 必须与 ensureBitmapViews 的上界一致：后者最多建 MAX_SUB_REGION_VIEWS 个
+         // View，若这里仍按 bitmaps.length（JNI 上限 100）循环，get(i) 会越界
+         final int count = regionCount(bitmaps.length, rects.length / 4);
+         ensureBitmapViews(count);
+ 
++        // 以整句字幕的"底边中点"为缩放锚点：放大时字幕保持贴底、左右居中扩展，
++        // 多个 region 的相对间距同比缩放（逐块各自缩放会互相重叠/散开）。
++        // userScale == 1.0 时下面的变换与原逻辑完全等价。
++        float minX = Float.MAX_VALUE, maxX = -Float.MAX_VALUE, bottomY = -Float.MAX_VALUE;
++        for (int i = 0; i < count; i++) {
++            minX = Math.min(minX, (float) rects[i * 4]);
++            maxX = Math.max(maxX, (float) (rects[i * 4] + rects[i * 4 + 2]));
++            bottomY = Math.max(bottomY, (float) (rects[i * 4 + 1] + rects[i * 4 + 3]));
++        }
++        if (count == 0) {
++            minX = 0f;
++            maxX = 0f;
++            bottomY = 0f;
++        }
++        final float anchorX = (minX + maxX) / 2f * sx;
++        final float anchorY = bottomY * sy;
++
+         int firstX = -1, firstY = -1, firstW = -1, firstH = -1;
+ 
+         for (int i = 0; i < count; i++) {
+@@ -2991,8 +3011,8 @@ public class VlcVideo extends FrameLayout {
+                 if (lp == null) {
+                     lp = new FrameLayout.LayoutParams(0, 0);
+                 }
+-                final int dstW = Math.round(w * sx);
+-                final int dstH = Math.round(h * sy);
++                final int dstW = Math.round(w * sx * userScale);
++                final int dstH = Math.round(h * sy * userScale);
+                 // 只有尺寸变化时才动 LayoutParams（会触发一次 layout）。位置每句都在变，
+                 // 统一用 setX/setY（translation）定位，**不触发 requestLayout** —— 否则每句
+                 // 字幕都会让整个 RelativeLayout 重排，主线程一卡（实测伴随视频丢帧）。
+@@ -3008,8 +3028,8 @@ public class VlcVideo extends FrameLayout {
+                     lp.gravity = Gravity.TOP | Gravity.LEFT;
+                     iv.setLayoutParams(lp);
+                 }
+-                final int x = Math.round(rects[i * 4] * sx);
+-                final int y = Math.round(rects[i * 4 + 1] * sy);
++                final int x = Math.round(anchorX + (rects[i * 4] * sx - anchorX) * userScale);
++                final int y = Math.round(anchorY + (rects[i * 4 + 1] * sy - anchorY) * userScale);
+                 iv.setX(x);
+                 iv.setY(y);
+                 iv.setVisibility(View.VISIBLE);
+@@ -3032,7 +3052,7 @@ public class VlcVideo extends FrameLayout {
+ 
+         if (count > 0) {
+             logShow(TAG, "bitmap draw: " + count + " region(s), view=" + viewW + "x" + viewH
+-                    + " scale=" + sx + "/" + sy
++                    + " scale=" + sx + "/" + sy + " user=" + userScale
+                     + ", first video(" + rects[0] + "," + rects[1] + " "
+                     + rects[2] + "x" + rects[3] + ")"
+                     + " -> view(" + firstX + "," + firstY + " " + firstW + "x" + firstH + ")");

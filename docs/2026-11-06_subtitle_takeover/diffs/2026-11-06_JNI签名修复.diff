@@ -1,0 +1,13 @@
+﻿diff --git a/libvlcjni/libvlc/jni/libvlcjni-mediaplayer.c b/libvlcjni/libvlc/jni/libvlcjni-mediaplayer.c
+index 665cb84..b667e55 100644
+--- a/libvlcjni/libvlc/jni/libvlcjni-mediaplayer.c
++++ b/libvlcjni/libvlc/jni/libvlcjni-mediaplayer.c
+@@ -1527,7 +1527,7 @@ Java_org_videolan_libvlc_MediaPlayer_nativeSetSubtitleBitmapListener(
+     jobject gref = (*env)->NewGlobalRef(env, listener);
+     jclass clazz = (*env)->GetObjectClass(env, listener);
+     jmethodID mid = (*env)->GetMethodID(env, clazz, "onSubtitleBitmaps",
+-            "([[B[IIIIJJ)V");
++            "([[B[IIIJJ)V");
+     (*env)->DeleteLocalRef(env, clazz);
+     if (!gref || !mid) {
+         if ((*env)->ExceptionCheck(env))

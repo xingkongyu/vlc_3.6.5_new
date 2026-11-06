@@ -13,6 +13,15 @@ libvlc-release-<时间戳>_baseline.aar      # 对照基线（重装前的历史
 |---|---|---|
 | `libvlc-release-20261102_112606_baseline.aar` | 23.7 MB | **基线**：系统重装前使用的版本，作为行为对照基准 |
 | `libvlc-release-20261105_182029.aar` | 23.8 MB | 重建并补齐定制后的版本，见下 |
+| `libvlc-release-20261106_095230.aar` | 23.9 MB | JNI 位图回调方法描述符修复后重编（`([[B[IIIJJ)V`） |
+| `libvlc-release-20261106_105410.aar` | 23.9 MB | **当前稳定版**：在 095230 基础上补 core 空轨/反注册 CLEAR |
+
+## 20261106 版本说明
+
+- `095230`：仅修 `libvlcjni.so` 的 `onSubtitleBitmaps` JNI 签名（原签名多一个 `I`，`GetMethodID` 返回 NULL、异常被 `ExceptionClear` 吞掉，Java 层假成功而 core `pf_bitmap` 始终为空）。
+- `105410`：core `vout_subpictures.c` 把调色板改色回退为 bridge 内 alpha 遮罩改色，并在 `vlc_spu_set_bitmap_listener()` 注册/反注册前、`SpuRender()` 空队列提前返回前各补发一次 CLEAR；`libvlc.so` 含 `notify external before listener change`。
+- 两者均只编 `armeabi-v7a`；App `vlc/libs/` 当前使用 `105410`。
+- 完整改动文档与补丁见 `docs/2026-11-06_subtitle_takeover/`。
 
 ## 20261105_182029 版本说明
 

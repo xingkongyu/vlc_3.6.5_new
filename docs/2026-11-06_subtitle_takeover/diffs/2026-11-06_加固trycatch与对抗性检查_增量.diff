@@ -1,0 +1,316 @@
+diff --git "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_11-17-35_\345\212\240\345\233\272trycatch\344\270\216\345\257\271\346\212\227\346\200\247\346\243\200\346\237\245\\before\\VlcVideo.java" "b/D:\\workspace\\A14\\a14_2\\publicversion\\vlc\\src\\main\\java\\com\\hhhc\\vlc\\VlcVideo.java"
+index aced247..0b21eab 100644
+--- "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_11-17-35_\345\212\240\345\233\272trycatch\344\270\216\345\257\271\346\212\227\346\200\247\346\243\200\346\237\245\\before\\VlcVideo.java"
++++ "b/D:\\workspace\\A14\\a14_2\\publicversion\\vlc\\src\\main\\java\\com\\hhhc\\vlc\\VlcVideo.java"
+@@ -241,25 +241,30 @@ public class VlcVideo extends FrameLayout {
+             }
+ 
+             mSubtitleHandler.post(() -> {
+-                if (mDestroyed || mSubtitleView == null || !mUseVlcTextListener) {
+-                    return;
+-                }
+-                // 内核按 region 以换行连接，去掉末尾多余换行
+-                String trimmed = finalText.replaceAll("\n+$", "");
+-                if (trimmed.isEmpty() || !mCustomSubtitleVisible) {
+-                    // 无条件确保屏幕干净：mShownSubtitleText 可能已被切轨清成 null，
+-                    // 但 View 仍是 VISIBLE，此时条件隐藏会把上一轨文本留在屏幕上。
+-                    mShownSubtitleText = null;
+-                    if (mSubtitleView.getVisibility() != View.GONE) {
+-                        mSubtitleView.setText("");
+-                        mSubtitleView.setVisibility(View.GONE);
++                try {
++                    if (mDestroyed || mSubtitleView == null || !mUseVlcTextListener) {
++                        return;
+                     }
+-                    return;
+-                }
+-                if (mShownSubtitleText == null || !mShownSubtitleText.equals(trimmed)) {
+-                    mShownSubtitleText = trimmed;
+-                    mSubtitleView.setText(trimmed);
+-                    mSubtitleView.setVisibility(View.VISIBLE);
++                    // 内核按 region 以换行连接，去掉末尾多余换行
++                    String trimmed = finalText.replaceAll("\n+$", "");
++                    if (trimmed.isEmpty() || !mCustomSubtitleVisible) {
++                        // 无条件确保屏幕干净：mShownSubtitleText 可能已被切轨清成 null，
++                        // 但 View 仍是 VISIBLE，此时条件隐藏会把上一轨文本留在屏幕上。
++                        mShownSubtitleText = null;
++                        if (mSubtitleView.getVisibility() != View.GONE) {
++                            mSubtitleView.setText("");
++                            mSubtitleView.setVisibility(View.GONE);
++                        }
++                        return;
++                    }
++                    if (mShownSubtitleText == null || !mShownSubtitleText.equals(trimmed)) {
++                        mShownSubtitleText = trimmed;
++                        mSubtitleView.setText(trimmed);
++                        mSubtitleView.setVisibility(View.VISIBLE);
++                    }
++                } catch (Throwable t) {
++                    // 主线程 Runnable 未捕获异常会崩 App；单条回调失败只影响这一句
++                    logShow(TAG, "onSubtitleText apply FAILED: " + t);
+                 }
+             });
+         }
+@@ -2503,9 +2508,20 @@ public class VlcVideo extends FrameLayout {
+             case 6: sp = 90f; break;
+             default: sp = size; break; // 直接视为字号
+         }
++        // sp 可能来自外部异常值（default 分支直接采用入参）：先夹紧，
++        // 避免 NaN/Infinity 传给 TextView 或让字号无限放大
++        if (Float.isNaN(sp) || Float.isInfinite(sp) || sp <= 0f) {
++            sp = 36f;
++        } else if (sp > 200f) {
++            sp = 200f;
++        }
+         mSubtitleTextSizeSp = sp;
+-        if (mSubtitleView != null) {
+-            mSubtitleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
++        try {
++            if (mSubtitleView != null) {
++                mSubtitleView.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
++            }
++        } catch (Throwable t) {
++            logShow(TAG, "setSubtitleSize text FAILED: " + t);
+         }
+         // 位图字幕(PGS/DVD 等非文本)同步：将字号映射为 VLC sub-scale 缩放系数
+         mSubtitleBitmapScale = subtitleScaleFromSp(sp);
+@@ -2713,11 +2729,19 @@ public class VlcVideo extends FrameLayout {
+         // 已排队的 draw 任务若代际不变，会在清屏之后又把旧字幕画回来
+         // （切字幕轨/关字幕/切到外挂字幕时的“一句话残留”就是这个机制）。
+         // 顺序严格为「先自增代际、再隐藏」，与 setVideoPath() 一致。
++        // 代际递增必须无条件先执行：即使后续 View 操作失败，也要让在途绘制任务失效
+         mSubtitleGen.incrementAndGet();
+-        mShownSubtitleText = null;
+-        if (mSubtitleView != null) {
+-            mSubtitleView.setVisibility(View.GONE);
++        try {
++            mShownSubtitleText = null;
++            if (mSubtitleView != null) {
++                // 同时清文本：只 GONE 的话，别处重新置 VISIBLE 会让旧句"复活"
++                mSubtitleView.setText("");
++                mSubtitleView.setVisibility(View.GONE);
++            }
++        } catch (Throwable t) {
++            logShow(TAG, "hideCustomSubtitle text FAILED: " + t);
+         }
++        // 与文本清屏分开，避免一处异常连带另一处不做；内部已有兜底
+         hideBitmapSubtitle();
+     }
+ 
+@@ -2887,7 +2911,14 @@ public class VlcVideo extends FrameLayout {
+         final int n = (int) n64;
+         // 复用缓冲（不够才扩容）：返回的是共享缓冲，调用方要立即消费
+         if (mArgbBuffer == null || mArgbBuffer.length < n) {
+-            mArgbBuffer = new int[n];
++            try {
++                mArgbBuffer = new int[n];
++            } catch (OutOfMemoryError e) {
++                // OutOfMemoryError 不是 Exception，普通 catch 抓不住；
++                // 后台线程里冒出去会终止 Looper，之后位图字幕永久不刷新
++                logShow(TAG, "argb buffer OOM: " + w + "x" + h);
++                return null;
++            }
+         }
+         final int[] out = mArgbBuffer;
+         // 颜色策略：core 已改为回传原色（不再用 sub-color 把整张 RGBA 染成单色），
+@@ -2998,11 +3029,30 @@ public class VlcVideo extends FrameLayout {
+      */
+     private void applyBitmapArray(Bitmap[] bitmaps, int[] rects,
+                                   int videoWidth, int videoHeight) {
+-        if (videoWidth <= 0 || videoHeight <= 0) {
++        try {
++            applyBitmapArrayInner(bitmaps, rects, videoWidth, videoHeight);
++        } catch (Throwable t) {
++            // 主线程最后防线：异常绝不能冒到 Looper 外（会崩 App）。
++            // 清屏优先，宁可少显示一句，也不能留下半绘制的残影。
++            logShow(TAG, "applyBitmapArray FAILED: " + t);
++            try {
++                hideBitmapSubtitle();
++            } catch (Throwable ignored) {
++            }
++        }
++    }
++
++    private void applyBitmapArrayInner(Bitmap[] bitmaps, int[] rects,
++                                       int videoWidth, int videoHeight) {
++        if (bitmaps == null || rects == null || videoWidth <= 0 || videoHeight <= 0
++                || mDestroyed || mBitmapSubtitleContainer == null) {
+             return;
+         }
+-        int viewW = getWidth() > 0 ? getWidth() : mVideoLayout.getWidth();
+-        int viewH = getHeight() > 0 ? getHeight() : mVideoLayout.getHeight();
++        // mVideoLayout 可能已随窗口销毁，不能无条件解引用
++        int viewW = getWidth() > 0 ? getWidth()
++                : (mVideoLayout != null ? mVideoLayout.getWidth() : 0);
++        int viewH = getHeight() > 0 ? getHeight()
++                : (mVideoLayout != null ? mVideoLayout.getHeight() : 0);
+         if (viewW <= 0 || viewH <= 0) {
+             // 布局还没完成（首帧）：下次回调再画，避免按 0 尺寸算出错误位置
+             if (!mBitmapLayoutWarned) {
+@@ -3017,7 +3067,9 @@ public class VlcVideo extends FrameLayout {
+         final float sy = (float) viewH / (float) videoHeight;
+         // 用户字号缩放：字幕接管后由本控件的 ImageView 绘制，core 的 sub-scale 不会
+         // 作用到回传位图，必须在这里把 mSubtitleBitmapScale 应用到尺寸与坐标上。
+-        final float userScale = mSubtitleBitmapScale > 0f ? mSubtitleBitmapScale : 1.0f;
++        // 绘制侧二次夹紧：mSubtitleBitmapScale 可能被外部路径直接改写，
++        // NaN / Infinity / 超大值会让 Math.round 得到 Integer.MAX_VALUE 的 LayoutParams
++        final float userScale = clampSubtitleScale(mSubtitleBitmapScale);
+ 
+         // 必须与 ensureBitmapViews 的上界一致：后者最多建 MAX_SUB_REGION_VIEWS 个
+         // View，若这里仍按 bitmaps.length（JNI 上限 100）循环，get(i) 会越界
+@@ -3044,9 +3096,10 @@ public class VlcVideo extends FrameLayout {
+         int firstX = -1, firstY = -1, firstW = -1, firstH = -1;
+ 
+         for (int i = 0; i < count; i++) {
+-            final ImageView iv = mBitmapSubtitleViews.get(i);
+-            final Bitmap bmp = bitmaps[i];
+             try {
++                // get(i) 也可能越界（ensureBitmapViews 扩容失败时），必须一起兜住
++                final ImageView iv = mBitmapSubtitleViews.get(i);
++                final Bitmap bmp = bitmaps[i];
+                 if (bmp == null) {
+                     iv.setVisibility(View.GONE);
+                     continue;
+@@ -3061,8 +3114,9 @@ public class VlcVideo extends FrameLayout {
+                 if (lp == null) {
+                     lp = new FrameLayout.LayoutParams(0, 0);
+                 }
+-                final int dstW = Math.round(w * sx * userScale);
+-                final int dstH = Math.round(h * sy * userScale);
++                // 异常 rect / scale 不能让 LayoutParams 变成 Integer.MAX_VALUE
++                final int dstW = clampSubDim(Math.round(w * sx * userScale), viewW);
++                final int dstH = clampSubDim(Math.round(h * sy * userScale), viewH);
+                 // 只有尺寸变化时才动 LayoutParams（会触发一次 layout）。位置每句都在变，
+                 // 统一用 setX/setY（translation）定位，**不触发 requestLayout** —— 否则每句
+                 // 字幕都会让整个 RelativeLayout 重排，主线程一卡（实测伴随视频丢帧）。
+@@ -3078,8 +3132,11 @@ public class VlcVideo extends FrameLayout {
+                     lp.gravity = Gravity.TOP | Gravity.LEFT;
+                     iv.setLayoutParams(lp);
+                 }
+-                final int x = Math.round(anchorX + (rects[i * 4] * sx - anchorX) * userScale);
+-                final int y = Math.round(anchorY + (rects[i * 4 + 1] * sy - anchorY) * userScale);
++                // 锚点本身来自 rects，异常值也要夹紧，避免 setX/setY 到极大 translation
++                final int x = clampSubPos(
++                        Math.round(anchorX + (rects[i * 4] * sx - anchorX) * userScale), viewW);
++                final int y = clampSubPos(
++                        Math.round(anchorY + (rects[i * 4 + 1] * sy - anchorY) * userScale), viewH);
+                 iv.setX(x);
+                 iv.setY(y);
+                 iv.setVisibility(View.VISIBLE);
+@@ -3093,7 +3150,9 @@ public class VlcVideo extends FrameLayout {
+                 // 单块 region 显示失败不能连累整句，更不能崩 App
+                 logShow(TAG, "bitmap apply[" + i + "] FAILED: " + t);
+                 try {
+-                    iv.setVisibility(View.GONE);
++                    if (i < mBitmapSubtitleViews.size()) {
++                        mBitmapSubtitleViews.get(i).setVisibility(View.GONE);
++                    }
+                 } catch (Throwable ignored) {
+                     // 忽略：连隐藏都失败就没别的可做了
+                 }
+@@ -3108,11 +3167,16 @@ public class VlcVideo extends FrameLayout {
+                     + " -> view(" + firstX + "," + firstY + " " + firstW + "x" + firstH + ")");
+         }
+ 
+-        for (int i = count; i < mBitmapSubtitleViews.size(); i++) {
+-            mBitmapSubtitleViews.get(i).setVisibility(View.GONE);
+-        }
+-        if (mBitmapSubtitleContainer != null) {
+-            mBitmapSubtitleContainer.setVisibility(count > 0 ? View.VISIBLE : View.GONE);
++        try {
++            for (int i = count; i < mBitmapSubtitleViews.size(); i++) {
++                mBitmapSubtitleViews.get(i).setVisibility(View.GONE);
++            }
++            if (mBitmapSubtitleContainer != null) {
++                mBitmapSubtitleContainer.setVisibility(count > 0 ? View.VISIBLE : View.GONE);
++            }
++        } catch (Throwable t) {
++            // 收尾只负责隐藏多余 View，失败也不能让整句绘制白做
++            logShow(TAG, "bitmap draw finalize FAILED: " + t);
+         }
+     }
+ 
+@@ -3227,12 +3291,38 @@ public class VlcVideo extends FrameLayout {
+      * 与 VLC sub-scale 变量范围(0.1~5.0)对齐。
+      */
+     private static float subtitleScaleFromSp(float sp) {
++        if (Float.isNaN(sp) || Float.isInfinite(sp) || sp <= 0f) {
++            return 1.0f;
++        }
+         float scale = sp / 36f;
+         if (scale < 0.1f) scale = 0.1f;
+         else if (scale > 5.0f) scale = 5.0f;
+         return scale;
+     }
+ 
++    /** 绘制侧二次夹紧：mSubtitleBitmapScale 可能被外部路径直接改写，不能只依赖 setter */
++    private static float clampSubtitleScale(float scale) {
++        if (Float.isNaN(scale) || Float.isInfinite(scale) || scale <= 0f) return 1.0f;
++        if (scale < 0.1f) return 0.1f;
++        if (scale > 5.0f) return 5.0f;
++        return scale;
++    }
++
++    /** 尺寸上限：异常 rect/scale 不能让 LayoutParams 变成 Integer.MAX_VALUE */
++    private static int clampSubDim(int dim, int viewSize) {
++        if (dim <= 0) return 1;
++        final long max = (long) Math.max(1, viewSize) * 6L;
++        return (int) Math.min((long) dim, max);
++    }
++
++    /** 坐标上限：异常锚点不能把 View 放到极大的 translation 上 */
++    private static int clampSubPos(int pos, int viewSize) {
++        final long limit = (long) Math.max(1, viewSize) * 6L;
++        if (pos > limit) return (int) limit;
++        if (pos < -limit) return (int) -limit;
++        return pos;
++    }
++
+     /**
+      * 将位图字幕的缩放参数下发到 VLC 运行中的播放器
+      * (MediaPlayer.setSubtitleScale 对应 libvlcjni 的 nativeSetSubtitleScale)。
+@@ -3260,7 +3350,13 @@ public class VlcVideo extends FrameLayout {
+      */
+     private void applyBitmapSubtitleToMedia(IMedia media) {
+         if (media == null) return;
+-        media.addOption(":sub-scale=" + mSubtitleBitmapScale);
++        try {
++            // 夹紧后再注入，避免 ":sub-scale=NaN/Infinity" 写进 core
++            media.addOption(":sub-scale=" + clampSubtitleScale(mSubtitleBitmapScale));
++        } catch (Throwable t) {
++            // media 可能已被释放；字幕缩放只是显示参数，绝不能阻断起播
++            logShow(TAG, "applyBitmapSubtitleToMedia FAILED: " + t);
++        }
+     }
+ 
+     /**
+diff --git "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_11-17-35_\345\212\240\345\233\272trycatch\344\270\216\345\257\271\346\212\227\346\200\247\346\243\200\346\237\245\\before\\VideoActivity2.java" "b/D:\\workspace\\A14\\a14_2\\publicversion\\app\\src\\main\\java\\com\\hhhc\\mediacenter\\VideoActivity2.java"
+index 2467d81..0133ca6 100644
+--- "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_11-17-35_\345\212\240\345\233\272trycatch\344\270\216\345\257\271\346\212\227\346\200\247\346\243\200\346\237\245\\before\\VideoActivity2.java"
++++ "b/D:\\workspace\\A14\\a14_2\\publicversion\\app\\src\\main\\java\\com\\hhhc\\mediacenter\\VideoActivity2.java"
+@@ -297,13 +297,18 @@ public class VideoActivity2 extends BaseActivity {
+         // Activity 层这两个 View 的文本与显隐会一直留到 onPrepared 的
+         // setSubtitleIndex() 重新加载；若新集没有字幕轨就是永久残留。
+         // 不调用 stop()：外挂字幕引擎由 onStart() 启动，切集不重跑 onStart。
+-        if (mTextSubtitle != null) {
+-            mTextSubtitle.setText(" ");
+-            mTextSubtitle.setVisibility(View.GONE);
+-        }
+-        if (mSubtitleView != null) {
+-            mSubtitleView.setText(" ");
+-            mSubtitleView.setVisibility(View.GONE);
++        try {
++            if (mTextSubtitle != null) {
++                mTextSubtitle.setText(" ");
++                mTextSubtitle.setVisibility(View.GONE);
++            }
++            if (mSubtitleView != null) {
++                mSubtitleView.setText(" ");
++                mSubtitleView.setVisibility(View.GONE);
++            }
++        } catch (Throwable t) {
++            // View 可能已随窗口销毁；清屏失败不该阻断起播
++            LogUtils.d(TAG, "playVideo: clear subtitle view failed: " + t);
+         }
+         // 起播前校验：目标文件已不存在或所在卷已卸载时禁止起播，
+         // 避免 VLC 打开已移除 U 盘上的文件，又被 vold 以 SIGTERM 杀掉进程

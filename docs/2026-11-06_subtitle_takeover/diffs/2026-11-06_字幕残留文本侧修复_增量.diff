@@ -1,0 +1,30 @@
+diff --git "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_11-01-54_\345\255\227\345\271\225\346\256\213\347\225\231\346\226\207\346\234\254\344\276\247\344\277\256\345\244\215\\before\\VlcVideo.java" "b/D:\\workspace\\A14\\a14_2\\publicversion\\vlc\\src\\main\\java\\com\\hhhc\\vlc\\VlcVideo.java"
+index aa9e7cf..aced247 100644
+--- "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_11-01-54_\345\255\227\345\271\225\346\256\213\347\225\231\346\226\207\346\234\254\344\276\247\344\277\256\345\244\215\\before\\VlcVideo.java"
++++ "b/D:\\workspace\\A14\\a14_2\\publicversion\\vlc\\src\\main\\java\\com\\hhhc\\vlc\\VlcVideo.java"
+@@ -247,8 +247,11 @@ public class VlcVideo extends FrameLayout {
+                 // 内核按 region 以换行连接，去掉末尾多余换行
+                 String trimmed = finalText.replaceAll("\n+$", "");
+                 if (trimmed.isEmpty() || !mCustomSubtitleVisible) {
+-                    if (mShownSubtitleText != null) {
+-                        mShownSubtitleText = null;
++                    // 无条件确保屏幕干净：mShownSubtitleText 可能已被切轨清成 null，
++                    // 但 View 仍是 VISIBLE，此时条件隐藏会把上一轨文本留在屏幕上。
++                    mShownSubtitleText = null;
++                    if (mSubtitleView.getVisibility() != View.GONE) {
++                        mSubtitleView.setText("");
+                         mSubtitleView.setVisibility(View.GONE);
+                     }
+                     return;
+@@ -2044,8 +2047,10 @@ public class VlcVideo extends FrameLayout {
+              * 这里是即时响应的双保险，不依赖内核下一帧的时机）。 */
+             // ① 先作废此前所有在途的绘制任务（它们属于切轨前的旧字幕），
+             //    再清屏；顺序反了已排队任务会在清屏之后把旧字幕画回来。
++            //    **必须同时清文本 + 位图两条链路**：只 hideBitmapSubtitle() 时，
++            //    tv_subtitle 上上一轨的最后一句会一直挂着（真机切轨残留实测）。
+             mSubtitleGen.incrementAndGet();
+-            hideBitmapSubtitle();
++            hideCustomSubtitle();
+ 
+             /* 确保位图字幕桥注册（**幂等**：已注册则什么都不做）。
+              *

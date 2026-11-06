@@ -171,20 +171,6 @@ static struct {
     bool              b_has_last;     /* 上次是否已回传内容，用于补发 CLEAR */
 } spu_user_params = { VLC_STATIC_MUTEX, 0.f, 0, NULL, NULL, false, false };
 
-/* 重着色脏标记：缩放缓存（region->p_private）里存的是"已着色"的副本，
- * 颜色一变就必须整体重建，否则把颜色改回原色时恢复不回来。 */
-static bool s_recolor_dirty = false;
-
-/* 缩放脏标记：字幕的绝对位置是按当时的 scale 缓存的（渲染一次后
- * subpic->b_absolute 置真，位置不再随 scale 更新）。用户改字号后必须清掉
- * 这个标记，让内核按新 scale 重新定位，否则字幕会偏移甚至底部出屏。 */
-static bool s_scale_dirty = false;
-
-/* 改色时记下被改动的调色板及其原值（同一时刻只有一条字幕轨在显示，
- * 记录最近一个即可）；颜色改回原色时用它恢复。 */
-static video_palette_t *s_pal_touched = NULL;
-static uint8_t s_pal_orig[4] = { 0, 0, 0, 0 };
-
 #ifdef __ANDROID__
 # define SPUBMPTRACE(...) __android_log_print( ANDROID_LOG_INFO, "VLCSubBitmap", __VA_ARGS__ )
 #else
@@ -199,8 +185,6 @@ void spu_SetUserScale( float f_scale )
         f_scale = 5.f;
 
     vlc_mutex_lock( &spu_user_params.lock );
-    if ( spu_user_params.f_scale != f_scale )
-        s_scale_dirty = true;   /* 让渲染侧重新按新 scale 定位 */
     spu_user_params.f_scale = f_scale;
     vlc_mutex_unlock( &spu_user_params.lock );
 }
@@ -208,8 +192,6 @@ void spu_SetUserScale( float f_scale )
 void spu_SetUserColor( int i_color )
 {
     vlc_mutex_lock( &spu_user_params.lock );
-    if ( spu_user_params.i_color != i_color )
-        s_recolor_dirty = true;   /* 让渲染侧丢弃已着色的缩放缓存 */
     spu_user_params.i_color = i_color;
     vlc_mutex_unlock( &spu_user_params.lock );
 }
@@ -217,6 +199,26 @@ void spu_SetUserColor( int i_color )
 void vlc_spu_set_bitmap_listener( vlc_spu_bitmap_cb pf_bitmap, void *p_data,
                                   bool b_listener_only )
 {
+    /* 注册/反注册之前先补发一次 CLEAR：如果接管方屏幕上还留着上一轨
+     * (或上一集) 的最后一句字幕，这里不清就会一直挂着 —— 尤其
+     * setSpuTrack(-1) 关闭字幕后 SPU 队列变空、SpuRender() 直接 return，
+     * 内核不会再有任何清空通知。
+     *
+     * 必须在本函数的持锁区之外调用回调：SpuBitmapBridgeNotify() 内部也要拿
+     * spu_user_params.lock，同一把锁重入会死锁，所以这里手工取快照再补发。 */
+    vlc_mutex_lock( &spu_user_params.lock );
+    const vlc_spu_bitmap_cb pf_old = spu_user_params.pf_bitmap;
+    void *p_old_data = spu_user_params.p_bitmap_data;
+    const bool b_old_only = spu_user_params.b_bitmap_only;
+    const bool b_old_has_last = spu_user_params.b_has_last;
+    vlc_mutex_unlock( &spu_user_params.lock );
+
+    if ( pf_old && b_old_only && b_old_has_last )
+    {
+        pf_old( p_old_data, 0, NULL, NULL, 0, 0, 0, 0 );
+        SPUBMPTRACE( "bitmap clear: notify external before listener change" );
+    }
+
     vlc_mutex_lock( &spu_user_params.lock );
     /* 重新注册时必须清掉"上次已回传"标记：否则切轨后相同内容不再回调，
      * App 侧会停在上一轨的旧画面上。 */
@@ -310,9 +312,11 @@ static bool SpuBitmapBridgeNotify( spu_t *spu, subpicture_t *p_output )
         return false;
     }
 
-    /* 注意：颜色已经在渲染阶段通过调色板处理过了（SpuRenderRegion 里改 palette[1]），
-     * 这里回传的 RGBA 已经是正确颜色，不能再做像素级替换 —— 否则描边会被染掉、
-     * 字幕看起来变粗。 */
+    const int i_color = SpuUserColorGet();
+    const int i_r = ( i_color >> 16 ) & 0xff;
+    const int i_g = ( i_color >>  8 ) & 0xff;
+    const int i_b =   i_color         & 0xff;
+
     int n = 0;
     for ( subpicture_region_t *r = p_output->p_region; r && n < i_count; r = r->p_next )
     {
@@ -332,7 +336,22 @@ static bool SpuBitmapBridgeNotify( spu_t *spu, subpicture_t *p_output )
         {
             const uint8_t *src = pic->p[0].p_pixels + (size_t) y * pic->p[0].i_pitch;
             uint8_t *dst = buf + (size_t) y * w * 4;
-            memcpy( dst, src, (size_t) w * 4 );
+            if ( i_color == 0 )
+            {
+                memcpy( dst, src, (size_t) w * 4 );
+            }
+            else
+            {   /* 用原 alpha 作遮罩替换 RGB（0xAARRGGBB） */
+                for ( int x = 0; x < w; x++ )
+                {
+                    dst[0] = (uint8_t) i_r;
+                    dst[1] = (uint8_t) i_g;
+                    dst[2] = (uint8_t) i_b;
+                    dst[3] = src[3];
+                    src += 4;
+                    dst += 4;
+                }
+            }
         }
 
         pp_rgba[n] = buf;
@@ -363,10 +382,6 @@ static bool SpuBitmapBridgeNotify( spu_t *spu, subpicture_t *p_output )
     free( p_rects );
     return true;
 }
-
-/* 图形字幕的重着色不在这里做：字幕通常是"白字黑边"，把渲染后的 RGBA 整体替换成
- * 目标色会把描边也染掉，描边一消失视觉上就变成"字变粗"。正确的做法是改调色板里
- * 的主文字色索引（见 SpuRenderRegion 内 using_palette 分支），描边索引不动。 */
 
 /*****************************************************************************
  * Local prototypes
@@ -1134,38 +1149,6 @@ static void SpuRenderRegion(spu_t *spu,
             *old_palette = new_palette;
     }
 
-    /* 图形字幕用户颜色：改调色板里的主文字色（索引 1），描边/阴影索引保持原样。
-     *
-     * 不能用"把渲染后的 RGBA 整体替换成目标色"的做法——字幕通常是"白字黑边"，
-     * 整体替换会把描边也染成文字色，描边消失后视觉上就变成"字变粗了"。
-     * 调色板方式只改文字本色，描边/阴影不受影响。
-     */
-    if (using_palette && !force_palette)
-    {
-        video_palette_t *pal = region->fmt.p_palette;
-        if (pal && pal->i_entries > 1)
-        {
-            const int i_color = SpuUserColorGet();
-            if (i_color != 0)
-            {
-                if (pal != s_pal_touched)
-                {
-                    memcpy(s_pal_orig, pal->palette[1], 4);
-                    s_pal_touched = pal;
-                }
-                pal->palette[1][0] = ( i_color >> 16 ) & 0xff;
-                pal->palette[1][1] = ( i_color >>  8 ) & 0xff;
-                pal->palette[1][2] =   i_color         & 0xff;
-            }
-            else if (pal == s_pal_touched)
-            {
-                /* 颜色改回"原色"：把调色板恢复回去 */
-                memcpy(pal->palette[1], s_pal_orig, 4);
-                s_pal_touched = NULL;
-            }
-        }
-    }
-
     /* */
     region_fmt = region->fmt;
     region_picture = region->p_picture;
@@ -1383,32 +1366,6 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
 {
     spu_private_t *sys = spu->p;
 
-    /* 用户缩放变化：丢弃已缓存的绝对位置，让内核按新 scale 重新定位字幕
-     * （否则放大后字幕仍停在旧位置，出现偏移/底部出屏）。 */
-    if ( s_scale_dirty )
-    {
-        s_scale_dirty = false;
-        for ( unsigned i = 0; i < i_subpicture; i++ )
-            pp_subpicture[i]->b_absolute = false;
-    }
-
-    /* 重着色发生变化：丢弃缩放缓存（里面是已着色的副本），强制下次重新渲染 */
-    if ( s_recolor_dirty )
-    {
-        s_recolor_dirty = false;
-        for ( unsigned i = 0; i < i_subpicture; i++ )
-        {
-            for ( subpicture_region_t *r = pp_subpicture[i]->p_region; r; r = r->p_next )
-            {
-                if ( r->p_private )
-                {
-                    subpicture_region_private_Delete( r->p_private );
-                    r->p_private = NULL;
-                }
-            }
-        }
-    }
-
     /* Count the number of regions and subtitle regions */
     unsigned int subtitle_region_count = 0;
     unsigned int region_count          = 0;
@@ -1518,20 +1475,6 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
                                                   fmt_dst->i_visible_height,
                                                   subpic->i_original_picture_height);
 
-            /* 图形字幕用户缩放：在「视频尺寸 / 字幕原始尺寸」的基础上再乘用户系数，
-             * 即整体放大/缩小字幕（锚点由下面的 area 计算保持居中）。 */
-            if (subpic->b_subtitle) {
-                const float f_user = SpuUserScaleGet(spu);
-                if (f_user > 0.f && f_user != 1.f) {
-                    scale.w = (int)(scale.w * f_user + 0.5f);
-                    scale.h = (int)(scale.h * f_user + 0.5f);
-                    if (scale.w <= 0)
-                        scale.w = 1;
-                    if (scale.h <= 0)
-                        scale.h = 1;
-                }
-            }
-
             /* Check scale validity */
             if (scale.w <= 0 || scale.h <= 0)
                 continue;
@@ -1565,9 +1508,7 @@ static subpicture_t *SpuRenderSubpictures(spu_t *spu,
 
     /* 位图字幕接管：把 RGBA region 回传给外部后丢弃，不再上屏。
      * （4K 下这条独立 RGBA Surface 是掉帧的主要来源，接管后由 App 用
-     *  ImageView 画在 UI 层，内核不再参与合成。）
-     *
-     * 颜色不在这里处理：接管模式下由 SpuBitmapBridgeNotify 内部按调色板处理。 */
+     *  ImageView 画在 UI 层，内核不再参与合成。） */
     if ( SpuBitmapBridgeNotify( spu, output ) )
     {
         subpicture_Delete( output );
@@ -2082,6 +2023,11 @@ subpicture_t *spu_Render(spu_t *spu,
 
     if (subpicture_count <= 0) {
         vlc_mutex_unlock(&sys->lock);
+        /* 队列为空也必须通知接管方清屏：关闭字幕轨 / 空轨 / 新轨首句未到时，
+         * 走不到 SpuRenderSubpictures() 里的 SpuBitmapBridgeNotify，外部
+         * ImageView 会一直显示上一句字幕（切轨/切集残留的内核侧根因）。
+         * b_has_last 保证只补发一次 CLEAR。 */
+        SpuBitmapBridgeNotify(spu, NULL);
         return NULL;
     }
 

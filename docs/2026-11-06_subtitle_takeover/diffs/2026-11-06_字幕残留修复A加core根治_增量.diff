@@ -1,0 +1,115 @@
+diff --git "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_10-48-47_\345\255\227\345\271\225\346\256\213\347\225\231\344\277\256\345\244\215A\345\212\240core\346\240\271\346\262\273\\before\\VlcVideo.java" "b/D:\\workspace\\A14\\a14_2\\publicversion\\vlc\\src\\main\\java\\com\\hhhc\\vlc\\VlcVideo.java"
+index df9c017..aa9e7cf 100644
+--- "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_10-48-47_\345\255\227\345\271\225\346\256\213\347\225\231\344\277\256\345\244\215A\345\212\240core\346\240\271\346\262\273\\before\\VlcVideo.java"
++++ "b/D:\\workspace\\A14\\a14_2\\publicversion\\vlc\\src\\main\\java\\com\\hhhc\\vlc\\VlcVideo.java"
+@@ -2042,9 +2042,10 @@ public class VlcVideo extends FrameLayout {
+              * 字幕（空轨，或首句还没到），上一轨的最后一句会**永久残留**在屏幕上。
+              * 这里主动清一次，保证切换瞬间屏幕是干净的（core 侧也已补发 clear，
+              * 这里是即时响应的双保险，不依赖内核下一帧的时机）。 */
+-            hideBitmapSubtitle();
+-            // ① 作废此前所有在途的绘制任务（它们属于切轨前的旧字幕）
++            // ① 先作废此前所有在途的绘制任务（它们属于切轨前的旧字幕），
++            //    再清屏；顺序反了已排队任务会在清屏之后把旧字幕画回来。
+             mSubtitleGen.incrementAndGet();
++            hideBitmapSubtitle();
+ 
+             /* 确保位图字幕桥注册（**幂等**：已注册则什么都不做）。
+              *
+@@ -2176,6 +2177,8 @@ public class VlcVideo extends FrameLayout {
+                 } catch (Exception e) {
+                     e.printStackTrace();
+                 }
++                // 同上：作废 setSpuTrack(-1) 期间 vout 补发的最后一帧
++                mSubtitleGen.incrementAndGet();
+                 return;
+             }
+             // subid 是 VLC Text 轨道 id：先换算成它在 Text 轨道列表中的位置，
+@@ -2344,6 +2347,9 @@ public class VlcVideo extends FrameLayout {
+             } catch (Exception e) {
+                 e.printStackTrace();
+             }
++            // 取消选轨期间 vout 可能刚渲染了上一轨最后一帧并回调内容，
++            // 再自增一次作废这批过渡帧（对齐 applyVlcSpuTrack 的兜底）。
++            mSubtitleGen.incrementAndGet();
+             return;
+         }
+         if (mSelectedSubtitleSeq >= 0) {
+@@ -2698,6 +2704,11 @@ public class VlcVideo extends FrameLayout {
+      * 隐藏字幕并清除当前显示文本。
+      */
+     private void hideCustomSubtitle() {
++        // 任何主动清屏都必须先作废在途的位图绘制任务：worker/主线程队列里
++        // 已排队的 draw 任务若代际不变，会在清屏之后又把旧字幕画回来
++        // （切字幕轨/关字幕/切到外挂字幕时的“一句话残留”就是这个机制）。
++        // 顺序严格为「先自增代际、再隐藏」，与 setVideoPath() 一致。
++        mSubtitleGen.incrementAndGet();
+         mShownSubtitleText = null;
+         if (mSubtitleView != null) {
+             mSubtitleView.setVisibility(View.GONE);
+diff --git "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_10-48-47_\345\255\227\345\271\225\346\256\213\347\225\231\344\277\256\345\244\215A\345\212\240core\346\240\271\346\262\273\\before\\VideoActivity2.java" "b/D:\\workspace\\A14\\a14_2\\publicversion\\app\\src\\main\\java\\com\\hhhc\\mediacenter\\VideoActivity2.java"
+index 737ae0a..2467d81 100644
+--- "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_10-48-47_\345\255\227\345\271\225\346\256\213\347\225\231\344\277\256\345\244\215A\345\212\240core\346\240\271\346\262\273\\before\\VideoActivity2.java"
++++ "b/D:\\workspace\\A14\\a14_2\\publicversion\\app\\src\\main\\java\\com\\hhhc\\mediacenter\\VideoActivity2.java"
+@@ -292,6 +292,19 @@ public class VideoActivity2 extends BaseActivity {
+         if(isFinishing()||isDestroyed()){
+             return;
+         }
++        // 切集起播前清掉上一集残留的外挂/文本字幕：
++        // VlcVideo.setVideoPath() 只清它内部的位图 ImageView / tv_subtitle，
++        // Activity 层这两个 View 的文本与显隐会一直留到 onPrepared 的
++        // setSubtitleIndex() 重新加载；若新集没有字幕轨就是永久残留。
++        // 不调用 stop()：外挂字幕引擎由 onStart() 启动，切集不重跑 onStart。
++        if (mTextSubtitle != null) {
++            mTextSubtitle.setText(" ");
++            mTextSubtitle.setVisibility(View.GONE);
++        }
++        if (mSubtitleView != null) {
++            mSubtitleView.setText(" ");
++            mSubtitleView.setVisibility(View.GONE);
++        }
+         // 起播前校验：目标文件已不存在或所在卷已卸载时禁止起播，
+         // 避免 VLC 打开已移除 U 盘上的文件，又被 vold 以 SIGTERM 杀掉进程
+         if (!isVideoPathPlayable(paths[indexs])) {
+diff --git "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_10-48-47_\345\255\227\345\271\225\346\256\213\347\225\231\344\277\256\345\244\215A\345\212\240core\346\240\271\346\262\273\\before\\vout_subpictures.c" "b/D:\\vlc-rescue-20261105\\work\\vlc_core-3.6.5\\src\\video_output\\vout_subpictures.c"
+index 9fae80c..daefb38 100644
+--- "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_10-48-47_\345\255\227\345\271\225\346\256\213\347\225\231\344\277\256\345\244\215A\345\212\240core\346\240\271\346\262\273\\before\\vout_subpictures.c"
++++ "b/D:\\vlc-rescue-20261105\\work\\vlc_core-3.6.5\\src\\video_output\\vout_subpictures.c"
+@@ -199,6 +199,26 @@ void spu_SetUserColor( int i_color )
+ void vlc_spu_set_bitmap_listener( vlc_spu_bitmap_cb pf_bitmap, void *p_data,
+                                   bool b_listener_only )
+ {
++    /* 注册/反注册之前先补发一次 CLEAR：如果接管方屏幕上还留着上一轨
++     * (或上一集) 的最后一句字幕，这里不清就会一直挂着 —— 尤其
++     * setSpuTrack(-1) 关闭字幕后 SPU 队列变空、SpuRender() 直接 return，
++     * 内核不会再有任何清空通知。
++     *
++     * 必须在本函数的持锁区之外调用回调：SpuBitmapBridgeNotify() 内部也要拿
++     * spu_user_params.lock，同一把锁重入会死锁，所以这里手工取快照再补发。 */
++    vlc_mutex_lock( &spu_user_params.lock );
++    const vlc_spu_bitmap_cb pf_old = spu_user_params.pf_bitmap;
++    void *p_old_data = spu_user_params.p_bitmap_data;
++    const bool b_old_only = spu_user_params.b_bitmap_only;
++    const bool b_old_has_last = spu_user_params.b_has_last;
++    vlc_mutex_unlock( &spu_user_params.lock );
++
++    if ( pf_old && b_old_only && b_old_has_last )
++    {
++        pf_old( p_old_data, 0, NULL, NULL, 0, 0, 0, 0 );
++        SPUBMPTRACE( "bitmap clear: notify external before listener change" );
++    }
++
+     vlc_mutex_lock( &spu_user_params.lock );
+     /* 重新注册时必须清掉"上次已回传"标记：否则切轨后相同内容不再回调，
+      * App 侧会停在上一轨的旧画面上。 */
+@@ -2003,6 +2023,11 @@ subpicture_t *spu_Render(spu_t *spu,
+ 
+     if (subpicture_count <= 0) {
+         vlc_mutex_unlock(&sys->lock);
++        /* 队列为空也必须通知接管方清屏：关闭字幕轨 / 空轨 / 新轨首句未到时，
++         * 走不到 SpuRenderSubpictures() 里的 SpuBitmapBridgeNotify，外部
++         * ImageView 会一直显示上一句字幕（切轨/切集残留的内核侧根因）。
++         * b_has_last 保证只补发一次 CLEAR。 */
++        SpuBitmapBridgeNotify(spu, NULL);
+         return NULL;
+     }
+ 

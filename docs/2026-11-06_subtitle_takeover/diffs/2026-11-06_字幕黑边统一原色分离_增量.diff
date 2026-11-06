@@ -1,0 +1,177 @@
+diff --git "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_10-32-40_\345\255\227\345\271\225\351\273\221\350\276\271\347\273\237\344\270\200\345\216\237\350\211\262\345\210\206\347\246\273\\before\\VlcVideo.java" "b/D:\\workspace\\A14\\a14_2\\publicversion\\vlc\\src\\main\\java\\com\\hhhc\\vlc\\VlcVideo.java"
+index e0b3975..df9c017 100644
+--- "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_10-32-40_\345\255\227\345\271\225\351\273\221\350\276\271\347\273\237\344\270\200\345\216\237\350\211\262\345\210\206\347\246\273\\before\\VlcVideo.java"
++++ "b/D:\\workspace\\A14\\a14_2\\publicversion\\vlc\\src\\main\\java\\com\\hhhc\\vlc\\VlcVideo.java"
+@@ -195,10 +195,10 @@ public class VlcVideo extends FrameLayout {
+     private volatile boolean mUseVlcTextListener = false;
+     /** 字幕字号（sp） */
+     private float mSubtitleTextSizeSp = 36f;
+-    /** 字幕颜色（ARGB） */
+-    private int mSubtitleTextColor = 0xFFFFFFFF;
+-    /** 用户是否显式设置过位图字幕颜色；false 时不对位图字幕重着色（保留原色） */
+-    private boolean mSubtitleColorExplicit = false;
++    /** 字幕颜色（ARGB）；后台位图转换线程会读取，需 volatile 保证可见性 */
++    private volatile int mSubtitleTextColor = 0xFFFFFFFF;
++    /** 用户是否显式设置过字幕颜色；false 时位图字幕保留原色（后台线程读取） */
++    private volatile boolean mSubtitleColorExplicit = false;
+     /** 位图字幕(VLC 内置渲染)缩放系数，由字号映射而来，对应 VLC sub-scale 变量，1.0=原始大小 */
+     private float mSubtitleBitmapScale = 1.0f;
+     /** 字幕位置 0=顶部 1=居中 2=底部 */
+@@ -897,8 +897,8 @@ public class VlcVideo extends FrameLayout {
+             // 初始化，导致 DTS/AC-3 直通(passthrough)的 AUDIO_OUTPUT_FLAG_DIRECT 请求
+             // 被 Android AudioFlinger 拒绝，触发 AudioTrack assertion 崩溃
+             VlcOptions.setMediaOptions(vlcOptionsPath,mediaTmp,true);
+-            // 位图字幕(PGS/DVD 等 VLC 内置渲染)：开播前把 sub-scale/sub-color 作为媒体选项注入，
+-            // 使本次播放一开播即生效；播放中改字号/颜色仍走 applyBitmapSubtitleParams() 实时下发
++            // 位图字幕(PGS/DVD 等)：开播前只注入 sub-scale；颜色不再注入 sub-color，
++            // 由 App 在 RGBA 转 ARGB 时按亮度分离黑边与字身（见 rgbaToPremultipliedArgb()）
+             applyBitmapSubtitleToMedia(mediaTmp);
+             mMediaPlayer.setMedia(mediaTmp);
+             // 添加多个外挂字幕（自动成为不同轨道）
+@@ -2523,7 +2523,8 @@ public class VlcVideo extends FrameLayout {
+         if (mSubtitleView != null) {
+             mSubtitleView.setTextColor(color);
+         }
+-        // 位图字幕(PGS/DVD 等非文本)同步：同一 ARGB 颜色经 VLC sub-color 实心着色
++        // 位图字幕(PGS/DVD 等非文本)：颜色不再下发给 core（会把原盘黑边一起染成字色），
++        // 改由 App 在 RGBA 转 ARGB 时按亮度分离；这里仍同步一次 sub-scale。
+         applyBitmapSubtitleParams();
+     }
+ 
+@@ -2820,6 +2821,13 @@ public class VlcVideo extends FrameLayout {
+      */
+     private static final long MAX_SUB_PIXELS = 1920L * 1080L;
+ 
++    /**
++     * 位图字幕「黑边」亮度上限：PGS/DVDSUB 原盘一般是亮色字身 + 暗色描边，
++     * 亮度低于此值的像素按描边处理、固定输出黑色；高于此值按字身替换为用户的字色。
++     * 这样描边恒为黑色、不随字幕颜色设置变化（与文本字幕 TextView 的黑色 shadow 统一）。
++     */
++    private static final int SUB_BORDER_LUMA_MAX = 64;
++
+     /**
+      * 预乘转换的复用缓冲（**仅在后台线程访问**，无并发问题）。
+      * <p>
+@@ -2845,6 +2853,10 @@ public class VlcVideo extends FrameLayout {
+      * 而预乘是逐像素操作，放在 vout 线程会吃掉视频帧输出预算
+      * （实测 418704 像素要 20~37ms -> picture is too late 丢帧 248ms），
+      * 所以 JNI 侧只做整块 memcpy，转换放在这里的后台线程。
++     * <p>
++     * 用户显式设色时，这里按亮度分离「暗色描边 / 亮色字身」（见
++     * {@code SUB_BORDER_LUMA_MAX}）：core 不再做整图重着色，否则原盘自带的
++     * 黑色描边会被一起染成字色，文字就没有黑边了。
+      */
+     private int[] rgbaToPremultipliedArgb(byte[] rgba, int w, int h) {
+         // 全部用 long 计算：w*h 在 int 上可能溢出，溢出后 new int[] 的尺寸是错的，
+@@ -2862,11 +2874,33 @@ public class VlcVideo extends FrameLayout {
+             mArgbBuffer = new int[n];
+         }
+         final int[] out = mArgbBuffer;
++        // 颜色策略：core 已改为回传原色（不再用 sub-color 把整张 RGBA 染成单色），
++        // 这里按亮度分离「暗色描边 / 亮色字身」：
++        //   - 暗像素固定输出黑色，保证文字边框统一为黑色、不随字色变化；
++        //   - 亮像素替换为用户字色，字幕颜色设置仍然生效；
++        //   - 未显式设色时保留原色，行为与改动前一致。
++        // 转换仍在后台 worker 逐像素完成，不占用 vout 线程预算。
++        final boolean recolor = mSubtitleColorExplicit;
++        final int ur = (mSubtitleTextColor >> 16) & 0xFF;
++        final int ug = (mSubtitleTextColor >> 8) & 0xFF;
++        final int ub = mSubtitleTextColor & 0xFF;
+         for (int i = 0; i < n; i++) {
+             final int a = rgba[i * 4 + 3] & 0xFF;
+-            final int r = rgba[i * 4 + 0] & 0xFF;
+-            final int g = rgba[i * 4 + 1] & 0xFF;
+-            final int b = rgba[i * 4 + 2] & 0xFF;
++            int r = rgba[i * 4 + 0] & 0xFF;
++            int g = rgba[i * 4 + 1] & 0xFF;
++            int b = rgba[i * 4 + 2] & 0xFF;
++            if (recolor) {
++                final int luma = (r * 299 + g * 587 + b * 114) / 1000;
++                if (luma < SUB_BORDER_LUMA_MAX) {
++                    r = 0;
++                    g = 0;
++                    b = 0;
++                } else {
++                    r = ur;
++                    g = ug;
++                    b = ub;
++                }
++            }
+             out[i] = (a << 24)
+                     | (div255(r * a) << 16)
+                     | (div255(g * a) << 8)
+@@ -3184,38 +3218,33 @@ public class VlcVideo extends FrameLayout {
+     }
+ 
+     /**
+-     * 将位图字幕的缩放/颜色参数直接下发到 VLC 运行中的播放器
+-     * (MediaPlayer.setSubtitleScale / setSubtitleColor，对应 libvlcjni 的
+-     * nativeSetSubtitleScale / nativeSetSubtitleColor，最终 var_Set 到 playlist 的
+-     * sub-scale / sub-color 命令变量，SpuRenderRegion 实时读取)。
+-     * 文本字幕走 TextView 自绘不受影响；本调用仅作用于 VLC 内置渲染的图形字幕(PGS/DVD 等)。
+-     * 播放前(setters 在 onStart 调用)与播放中(用户实时改字号/颜色)均可生效。
++     * 将位图字幕的缩放参数下发到 VLC 运行中的播放器
++     * (MediaPlayer.setSubtitleScale 对应 libvlcjni 的 nativeSetSubtitleScale)。
++     * 文本字幕走 TextView 自绘不受影响。
++     * <p>
++     * 颜色不再下发给 core：core 的 sub-color 会把整张 RGBA 的 RGB 全部替换成字色，
++     * 原盘 PGS 自带的黑色描边会被一起染掉。改为恒传 0 让 core 回传原色，
++     * 由 {@code rgbaToPremultipliedArgb()} 按亮度分离黑边与字身。
+      */
+     private void applyBitmapSubtitleParams() {
+         if (mMediaPlayer == null || mMediaPlayer.isReleased()) {
+             return;
+         }
+         try {
+-            // sub-scale 直接缩放位图字幕；sub-color 为 0xAARRGGBB（同 Android Color）。
+-            // 未显式设色时传 0：不触发 VLC 重着色，保留字幕原色。
+             mMediaPlayer.setSubtitleScale(mSubtitleBitmapScale);
+-            mMediaPlayer.setSubtitleColor(mSubtitleColorExplicit ? mSubtitleTextColor : 0);
++            mMediaPlayer.setSubtitleColor(0);
+         } catch (Exception e) {
+             logShow(TAG, "applyBitmapSubtitleParams failed: " + e.getMessage());
+         }
+     }
+ 
+     /**
+-     * 在 setMedia() 之前把位图字幕的缩放/颜色作为媒体选项注入，使本次播放一开播即生效。
+-     * sub-scale / sub-color 是 playlist 上的命令变量，媒体选项会在 input 创建时写入并转发到 playlist。
++     * 在 setMedia() 之前把位图字幕的缩放作为媒体选项注入，使本次播放一开播即生效。
++     * 不再注入 :sub-color，否则 core 会重着色并吃掉原盘的黑色描边。
+      */
+     private void applyBitmapSubtitleToMedia(IMedia media) {
+         if (media == null) return;
+         media.addOption(":sub-scale=" + mSubtitleBitmapScale);
+-        if (mSubtitleColorExplicit) {
+-            // 颜色为 0xAARRGGBB，媒体选项按无符号整数解析，避免负值的符号问题
+-            media.addOption(":sub-color=" + (mSubtitleTextColor & 0xFFFFFFFFL));
+-        }
+     }
+ 
+     /**
+diff --git "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_10-32-40_\345\255\227\345\271\225\351\273\221\350\276\271\347\273\237\344\270\200\345\216\237\350\211\262\345\210\206\347\246\273\\before\\activity_video2.xml" "b/D:\\workspace\\A14\\a14_2\\publicversion\\app\\src\\main\\res\\layout\\activity_video2.xml"
+index 3739ce4..e0c7c86 100644
+--- "a/D:\\vlc-rescue-20261105\\Backups\\2026-11-06_10-32-40_\345\255\227\345\271\225\351\273\221\350\276\271\347\273\237\344\270\200\345\216\237\350\211\262\345\210\206\347\246\273\\before\\activity_video2.xml"
++++ "b/D:\\workspace\\A14\\a14_2\\publicversion\\app\\src\\main\\res\\layout\\activity_video2.xml"
+@@ -285,6 +285,10 @@
+         android:gravity="bottom|center_horizontal"
+         android:textColor="#ffffff"
+         android:textSize="@dimen/text_size_36"
++        android:shadowColor="#FF000000"
++        android:shadowDx="1"
++        android:shadowDy="1"
++        android:shadowRadius="6"
+         app:layout_constraintBottom_toTopOf="@+id/constraintLayout"
+         app:layout_constraintEnd_toEndOf="parent"
+         app:layout_constraintStart_toStartOf="parent"
+@@ -299,6 +303,10 @@
+         android:gravity="bottom|center_horizontal"
+         android:textColor="#ffffff"
+         android:textSize="@dimen/text_size_36"
++        android:shadowColor="#FF000000"
++        android:shadowDx="1"
++        android:shadowDy="1"
++        android:shadowRadius="6"
+         android:visibility="gone"
+         app:layout_constraintBottom_toTopOf="@+id/constraintLayout"
+         app:layout_constraintEnd_toEndOf="parent"
